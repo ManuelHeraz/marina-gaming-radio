@@ -1,16 +1,12 @@
 require('dotenv').config();
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
 const { exec } = require('youtube-dl-exec');
 const fs = require('fs');
 const path = require('path');
-const { MongoClient } = require('mongodb'); // <-- IMPORTAMOS MONGODB
+const { spawn } = require('child_process');
+const axios = require('axios');
+const { MongoClient } = require('mongodb'); 
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-
-const cleanMountPoint = process.env.ZENO_MOUNT.replace(/^\//, '');
-const icecastUrl = `icecast://source:${process.env.ZENO_PASSWORD}@${process.env.ZENO_SERVER}:${process.env.ZENO_PORT}/${cleanMountPoint}`;
-
+// Solo necesitamos estas variables para el cerebro local/bóveda
 const rawPlaylist = fs.readFileSync(path.join(__dirname, 'playlist.json'));
 const playlistData = JSON.parse(rawPlaylist);
 
@@ -19,7 +15,9 @@ if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir);
 }
 
-let currentTrackIndex = 0;
+// Variables globales para el DJ
+let tracksPlayedSinceBumper = 0;
+const BUMPER_FREQUENCY = 4;
 
 // --- GESTIÓN DE BASE DE DATOS MONGODB ---
 let dbClient = null;
@@ -31,18 +29,12 @@ async function connectDB() {
         await dbClient.connect();
         console.log('[Sistema] Conectado a MongoDB Atlas exitosamente.');
     }
-    // Asumimos que la base de datos se llama 'marina_radio'
     return dbClient.db('marina_radio');
 }
 
-// Añadimos estas variables globales
-let currentTrackIndex = 0;
-let tracksPlayedSinceBumper = 0; // El contador
-const BUMPER_FREQUENCY = 4; // Cada cuántas canciones suena una cortinilla
-
-// --- EL CEREBRO HÍBRIDO (Nube + Local) ---
+// --- EL CEREBRO HÍBRIDO ---
 async function getNextTrack() {
-    // 1. INTENTO A: Buscar en MongoDB
+    // 1. Buscar en MongoDB
     if (process.env.MONGODB_URI) {
         try {
             const db = await connectDB();
@@ -67,50 +59,91 @@ async function getNextTrack() {
 
     // 2. ¿Es hora de una cortinilla?
     if (tracksPlayedSinceBumper >= BUMPER_FREQUENCY) {
-        tracksPlayedSinceBumper = 0; // Reiniciamos el contador
+        tracksPlayedSinceBumper = 0; 
         
         const assetsDir = path.join(__dirname, 'assets');
         
-        // Verificamos que la carpeta exista para evitar crasheos
         if (fs.existsSync(assetsDir)) {
-            // Escaneamos la carpeta y filtramos solo los archivos .mp3
             const mp3Files = fs.readdirSync(assetsDir).filter(file => file.endsWith('.mp3'));
             
             if (mp3Files.length > 0) {
                 console.log(`[Cerebro] Insertando cortinilla dinámica local...`);
-                // Elegimos un archivo al azar del arreglo
                 const randomFile = mp3Files[Math.floor(Math.random() * mp3Files.length)];
                 
                 return {
-                    // Usamos el nombre del archivo (sin el .mp3) como título para el reproductor
                     title: `Marina Gaming - ${randomFile.replace('.mp3', '')}`,
                     source: path.join(assetsDir, randomFile)
                 };
-            } else {
-                console.log(`[Cerebro] Carpeta assets sin archivos .mp3. Saltando cortinilla.`);
             }
-        } else {
-            console.log(`[Cerebro] No existe la carpeta assets. Saltando cortinilla.`);
         }
     }
 
-    // 3. INTENTO B (FALLBACK): Reproducción aleatoria de tu bóveda
+    // 3. Reproducción aleatoria de tu bóveda
     console.log(`[Cerebro] Cola vacía. Seleccionando pista aleatoria del respaldo.`);
     const randomIndex = Math.floor(Math.random() * playlistData.tracks.length);
     
-    // Aumentamos el contador porque acaba de sonar una pista musical normal
     tracksPlayedSinceBumper++; 
     
     return playlistData.tracks[randomIndex];
 }
 
-// --- ACTUALIZADA PARA ESPERAR EL ASYNC DE getNextTrack ---
+// --- NÚCLEO DE TRANSMISIÓN ---
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function streamToZeno(filePath, trackTitle) {
+    await sleep(2000); // 2 segundos para liberar firewall de Zeno
+
+    return new Promise(async (resolve, reject) => {
+        const streamUrl = `http://${process.env.ZENO_SERVER}:${process.env.ZENO_PORT}${process.env.ZENO_MOUNT}`;
+        
+        console.log(`[Node.js Transport] Transmitiendo a ZenoFM -> ${trackTitle}`);
+        
+        // Confinamos a FFmpeg
+        const ffmpegProcess = spawn('ffmpeg', [
+            '-re',
+            '-i', filePath,
+            '-c:a', 'libmp3lame',
+            '-b:a', '128k',
+            '-f', 'mp3',
+            'pipe:1'
+        ]);
+
+        try {
+            // Node maneja la red con Axios
+            await axios({
+                method: 'put',
+                url: streamUrl,
+                auth: {
+                    username: 'source',
+                    password: process.env.ZENO_PASSWORD
+                },
+                headers: {
+                    'Content-Type': 'audio/mpeg',
+                    'Ice-Name': 'Marina Gaming Radio',
+                    'Ice-Description': 'AutoDJ Transmitiendo',
+                    'Ice-Audio-Info': 'bitrate=128;samplerate=44100;channels=2'
+                },
+                data: ffmpegProcess.stdout,
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity,
+            });
+            
+            ffmpegProcess.on('close', () => resolve());
+            
+        } catch (error) {
+            ffmpegProcess.kill();
+            reject(new Error(`Fallo Axios: ${error.message}`));
+        }
+    });
+}
+
+// --- BUCLE PRINCIPAL ---
 async function startStreaming() {
-    const track = await getNextTrack(); // <-- AHORA USA AWAIT
+    const track = await getNextTrack();
     console.log(`\n[AutoDJ] Preparando: ${track.title}`);
 
     let audioSource = track.source;
-    const isExternalUrl = audioSource.includes('youtube.com') || audioSource.includes('youtu.be') || audioSource.includes('soundcloud.com') || audioSource.includes('on.soundcloud.com');
+    const isExternalUrl = audioSource.includes('youtube.com') || audioSource.includes('youtu.be') || audioSource.includes('soundcloud.com');
     
     let tempFilePath = null;
     let startTime = Date.now();
@@ -134,43 +167,18 @@ async function startStreaming() {
         }
     }
 
-    const command = ffmpeg(audioSource)
-        .inputOptions(['-re'])
-        .audioCodec('libmp3lame')
-        .audioBitrate('128k')
-        .audioChannels(2)
-        .audioFrequency(44100)
-        .format('mp3')
-        .outputOptions([
-            '-content_type', 'audio/mpeg',
-            '-ice_public', '1',
-            '-ice_name', 'Marina_Gaming_Radio' 
-        ]);
-
-    command
-        .output(icecastUrl, { end: false })
-        .on('start', () => {
-            console.log(`[FFmpeg] Transmitiendo a ZenoFM -> ${track.title}`);
-        })
-        .on('stderr', (stderrLine) => {
-            if (stderrLine.includes('size=')) {
-                // console.log(`[Motor FFmpeg]: ${stderrLine}`); 
-            }
-        })
-        .on('error', (err) => {
-            console.error(`[Error FFmpeg]: ${err.message}`);
-            cleanup(tempFilePath);
-            retryWithCooldown(startTime);
-        })
-        .on('end', () => {
-            console.log(`[AutoDJ] Pista terminada.`);
-            cleanup(tempFilePath);
-            retryWithCooldown(startTime);
-        });
-
-    command.run();
+    try {
+        await streamToZeno(audioSource, track.title);
+        console.log(`[AutoDJ] Pista terminada.`);
+    } catch (err) {
+        console.error(`[Error de Transmisión]: ${err.message}`);
+    } finally {
+        cleanup(tempFilePath);
+        retryWithCooldown(startTime);
+    }
 }
 
+// --- UTILIDADES ---
 function cleanup(filePath) {
     if (filePath && fs.existsSync(filePath)) {
         try {
@@ -194,26 +202,16 @@ function retryWithCooldown(startTime) {
 
 process.on('SIGINT', () => {
     console.log('\n[Sistema] Deteniendo AutoDJ de Marina Gaming Radio...');
-    console.log('[Sistema] Vaciando la caché efímera (Carpeta temp)...');
-    
     if (fs.existsSync(tempDir)) {
         const files = fs.readdirSync(tempDir);
-        let deletedCount = 0;
-        
         for (const file of files) {
-            try {
-                fs.unlinkSync(path.join(tempDir, file));
-                deletedCount++;
-            } catch (err) {
-                console.error(`[Error] No se pudo borrar ${file}: ${err.message}`);
-            }
+            try { fs.unlinkSync(path.join(tempDir, file)); } catch (err) {}
         }
-        console.log(`[Sistema] Limpieza completada: ${deletedCount} archivo(s) eliminado(s).`);
     }
-    
     console.log('[Sistema] Transmisión finalizada. ¡Hasta pronto, ingeniero!');
     process.exit(0);
 });
 
+// --- ARRANQUE ---
 console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO ---');
 startStreaming();

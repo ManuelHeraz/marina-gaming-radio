@@ -5,6 +5,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const axios = require('axios');
 const { MongoClient } = require('mongodb'); 
+const http = require('http');
 
 // Solo necesitamos estas variables para el cerebro local/bóveda
 const rawPlaylist = fs.readFileSync(path.join(__dirname, 'playlist.json'));
@@ -91,14 +92,13 @@ async function getNextTrack() {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function streamToZeno(filePath, trackTitle) {
-    await sleep(2000); // 2 segundos para liberar firewall de Zeno
+    await sleep(2000); 
 
     return new Promise(async (resolve, reject) => {
         const streamUrl = `http://${process.env.ZENO_SERVER}:${process.env.ZENO_PORT}${process.env.ZENO_MOUNT}`;
         
         console.log(`[Node.js Transport] Transmitiendo a ZenoFM -> ${trackTitle}`);
         
-        // Confinamos a FFmpeg
         const ffmpegProcess = spawn('ffmpeg', [
             '-re',
             '-i', filePath,
@@ -108,8 +108,10 @@ async function streamToZeno(filePath, trackTitle) {
             'pipe:1'
         ]);
 
+        // Agente persistente para evitar "socket hang up"
+        const keepAliveAgent = new http.Agent({ keepAlive: true });
+
         try {
-            // Node maneja la red con Axios
             await axios({
                 method: 'put',
                 url: streamUrl,
@@ -121,11 +123,14 @@ async function streamToZeno(filePath, trackTitle) {
                     'Content-Type': 'audio/mpeg',
                     'Ice-Name': 'Marina Gaming Radio',
                     'Ice-Description': 'AutoDJ Transmitiendo',
-                    'Ice-Audio-Info': 'bitrate=128;samplerate=44100;channels=2'
+                    'Ice-Audio-Info': 'bitrate=128;samplerate=44100;channels=2',
+                    'Connection': 'keep-alive' // Le pedimos al servidor que no cierre
                 },
+                httpAgent: keepAliveAgent, // Usamos el agente
                 data: ffmpegProcess.stdout,
                 maxBodyLength: Infinity,
                 maxContentLength: Infinity,
+                responseType: 'stream' // Importante para manejar flujos continuos sin atascos de RAM
             });
             
             ffmpegProcess.on('close', () => resolve());

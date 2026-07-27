@@ -94,51 +94,28 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function streamToZeno(filePath, trackTitle) {
     await sleep(2000); 
 
-    return new Promise(async (resolve, reject) => {
-        const streamUrl = `http://${process.env.ZENO_SERVER}:${process.env.ZENO_PORT}${process.env.ZENO_MOUNT}`;
+    return new Promise((resolve, reject) => {
+        // Armamos la URL de Icecast
+        const icecastUrl = `icecast://source:${process.env.ZENO_PASSWORD}@${process.env.ZENO_SERVER}:${process.env.ZENO_PORT}${process.env.ZENO_MOUNT}`;
         
-        console.log(`[Node.js Transport] Transmitiendo a ZenoFM -> ${trackTitle}`);
+        console.log(`[Shell Native] Transmitiendo a ZenoFM -> ${trackTitle}`);
         
-        const ffmpegProcess = spawn('ffmpeg', [
-            '-re',
-            '-i', filePath,
-            '-c:a', 'libmp3lame',
-            '-b:a', '128k',
-            '-f', 'mp3',
-            'pipe:1'
-        ]);
+        // Construimos el comando EXACTO que probaste a mano y funcionó
+        const cmd = `ffmpeg -re -i "${filePath}" -c:a libmp3lame -b:a 128k -content_type audio/mpeg -f mp3 "${icecastUrl}"`;
+        
+        // Magia negra: { shell: true } aísla a FFmpeg en su propia terminal, evadiendo el SIGSEGV
+        const ffmpegProcess = spawn(cmd, { shell: true });
 
-        // Agente persistente para evitar "socket hang up"
-        const keepAliveAgent = new http.Agent({ keepAlive: true });
+        // Si quieres ver si FFmpeg se queja de algo en secreto, descomenta esto:
+        ffmpegProcess.stderr.on('data', (data) => console.log(`[FFmpeg Log]: ${data}`));
 
-        try {
-            await axios({
-                method: 'put',
-                url: streamUrl,
-                auth: {
-                    username: 'source',
-                    password: process.env.ZENO_PASSWORD
-                },
-                headers: {
-                    'Content-Type': 'audio/mpeg',
-                    'Ice-Name': 'Marina Gaming Radio',
-                    'Ice-Description': 'AutoDJ Transmitiendo',
-                    'Ice-Audio-Info': 'bitrate=128;samplerate=44100;channels=2',
-                    'Connection': 'keep-alive' // Le pedimos al servidor que no cierre
-                },
-                httpAgent: keepAliveAgent, // Usamos el agente
-                data: ffmpegProcess.stdout,
-                maxBodyLength: Infinity,
-                maxContentLength: Infinity,
-                responseType: 'stream' // Importante para manejar flujos continuos sin atascos de RAM
-            });
-            
-            ffmpegProcess.on('close', () => resolve());
-            
-        } catch (error) {
-            ffmpegProcess.kill();
-            reject(new Error(`Fallo Axios: ${error.message}`));
-        }
+        ffmpegProcess.on('close', (code) => {
+            resolve();
+        });
+
+        ffmpegProcess.on('error', (err) => {
+            reject(new Error(`Fallo Shell Nativo: ${err.message}`));
+        });
     });
 }
 

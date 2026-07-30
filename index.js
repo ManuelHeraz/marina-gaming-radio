@@ -125,13 +125,38 @@ async function streamToZeno(filePath, trackTitle) {
         
         const ffmpegProcess = spawn(cmd, { shell: true });
 
-        // ffmpegProcess.stderr.on('data', (data) => console.log(`[FFmpeg Log]: ${data}`));
+        // --- INICIO DEL PERRO GUARDIÁN (WATCHDOG) ---
+        let watchdogTimer;
+        
+        const resetWatchdog = () => {
+            clearTimeout(watchdogTimer);
+            // Si pasan 15 segundos sin que FFmpeg procese datos, lo matamos
+            watchdogTimer = setTimeout(() => {
+                console.error(`[Watchdog] FFmpeg se congeló en la red. Forzando reinicio de pista...`);
+                ffmpegProcess.kill('SIGKILL'); // Tiro de gracia al proceso zombie
+                reject(new Error('Watchdog Timeout: Conexión caída'));
+            }, 15000);
+        };
+
+        // Activamos el guardián por primera vez
+        resetWatchdog();
+
+        // FFmpeg escupe su progreso constantemente por 'stderr'. 
+        // Usaremos este latido para calmar al Perro Guardián.
+        ffmpegProcess.stderr.on('data', (data) => {
+            resetWatchdog(); 
+            // Opcional: si quieres ver los logs de FFmpeg de nuevo, descomenta la siguiente línea:
+            // console.log(`[FFmpeg]: ${data}`);
+        });
+        // --- FIN DEL PERRO GUARDIÁN ---
 
         ffmpegProcess.on('close', (code) => {
+            clearTimeout(watchdogTimer); // Apagamos el guardián cuando la canción termina bien
             resolve();
         });
 
         ffmpegProcess.on('error', (err) => {
+            clearTimeout(watchdogTimer);
             reject(new Error(`Fallo Shell Nativo: ${err.message}`));
         });
     });

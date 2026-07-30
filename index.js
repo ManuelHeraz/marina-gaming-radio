@@ -7,7 +7,7 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb'); 
 const http = require('http');
 
-// Solo necesitamos estas variables para el cerebro local/bóveda
+// Bóveda de música principal
 const rawPlaylist = fs.readFileSync(path.join(__dirname, 'playlist.json'));
 const playlistData = JSON.parse(rawPlaylist);
 
@@ -63,19 +63,41 @@ async function getNextTrack() {
         tracksPlayedSinceBumper = 0; 
         
         const assetsDir = path.join(__dirname, 'assets');
+        const bumpersPath = path.join(assetsDir, 'bumpers.json');
         
+        let allBumpers = [];
+
+        // A. Cargar cortinillas físicas (.mp3)
         if (fs.existsSync(assetsDir)) {
             const mp3Files = fs.readdirSync(assetsDir).filter(file => file.endsWith('.mp3'));
-            
-            if (mp3Files.length > 0) {
-                console.log(`[Cerebro] Insertando cortinilla dinámica local...`);
-                const randomFile = mp3Files[Math.floor(Math.random() * mp3Files.length)];
+            const localBumpers = mp3Files.map(file => ({
+                title: `Marina Gaming - ${file.replace('.mp3', '')}`,
+                source: path.join(assetsDir, file)
+            }));
+            allBumpers = allBumpers.concat(localBumpers);
+        }
+
+        // B. Cargar cortinillas de YouTube (bumpers.json)
+        if (fs.existsSync(bumpersPath)) {
+            try {
+                const rawBumpers = fs.readFileSync(bumpersPath, 'utf8');
+                const bumpersData = JSON.parse(rawBumpers);
                 
-                return {
-                    title: `Marina Gaming - ${randomFile.replace('.mp3', '')}`,
-                    source: path.join(assetsDir, randomFile)
-                };
+                if (bumpersData && bumpersData.tracks && Array.isArray(bumpersData.tracks)) {
+                    allBumpers = allBumpers.concat(bumpersData.tracks);
+                }
+            } catch (error) {
+                console.error(`[Cerebro] Error leyendo bumpers.json: ${error.message}`);
             }
+        }
+
+        // C. Revolver la bolsa y sacar una al azar
+        if (allBumpers.length > 0) {
+            console.log(`[Cerebro] Insertando cortinilla aleatoria... (${allBumpers.length} opciones disponibles en total)`);
+            const randomIndex = Math.floor(Math.random() * allBumpers.length);
+            return allBumpers[randomIndex];
+        } else {
+            console.log(`[Cerebro] No se encontraron cortinillas en absoluto. Saltando...`);
         }
     }
 
@@ -92,22 +114,18 @@ async function getNextTrack() {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function streamToZeno(filePath, trackTitle) {
-    await sleep(2000); 
+    await sleep(500); 
 
     return new Promise((resolve, reject) => {
-        // Armamos la URL de Icecast
         const icecastUrl = `icecast://source:${process.env.ZENO_PASSWORD}@${process.env.ZENO_SERVER}:${process.env.ZENO_PORT}${process.env.ZENO_MOUNT}`;
         
         console.log(`[Shell Native] Transmitiendo a ZenoFM -> ${trackTitle}`);
         
-        // Construimos el comando EXACTO que probaste a mano y funcionó
-        const cmd = `ffmpeg -re -i "${filePath}" -c:a libmp3lame -b:a 128k -content_type audio/mpeg -f mp3 "${icecastUrl}"`;
+        const cmd = `ffmpeg -itsoffset 1 -re -i "${filePath}" -c:a libmp3lame -b:a 128k -bufsize 64k -content_type audio/mpeg -f mp3 "${icecastUrl}"`;
         
-        // Magia negra: { shell: true } aísla a FFmpeg en su propia terminal, evadiendo el SIGSEGV
         const ffmpegProcess = spawn(cmd, { shell: true });
 
-        // Si quieres ver si FFmpeg se queja de algo en secreto, descomenta esto:
-        ffmpegProcess.stderr.on('data', (data) => console.log(`[FFmpeg Log]: ${data}`));
+        // ffmpegProcess.stderr.on('data', (data) => console.log(`[FFmpeg Log]: ${data}`));
 
         ffmpegProcess.on('close', (code) => {
             resolve();
@@ -125,6 +143,7 @@ async function startStreaming() {
     console.log(`\n[AutoDJ] Preparando: ${track.title}`);
 
     let audioSource = track.source;
+    // Si la fuente incluye un enlace externo, sabemos que hay que descargarla primero
     const isExternalUrl = audioSource.includes('youtube.com') || audioSource.includes('youtu.be') || audioSource.includes('soundcloud.com');
     
     let tempFilePath = null;

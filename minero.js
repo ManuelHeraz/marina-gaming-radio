@@ -3,7 +3,7 @@ const fs = require('fs');
 
 // PON AQUÍ EL ENLACE DE UNA PLAYLIST PÚBLICA DE YOUTUBE
 // Ejemplo: una lista de 200 soundtracks épicos de videojuegos
-const PLAYLIST_URL = "https://youtube.com/playlist?list=PLjNlQ2vXx1xbt30X8TcUfNzw_akVISXEu&si=ZTQWkPhItn8pTRfZ"; // <- CAMBIA ESTO
+const PLAYLIST_URL = "https://youtube.com/playlist?list=PLGzv-vVL30V1oPPa7nVcUzLqyT8AsqwEb&si=bqE2pzihdh5R8wyT"; // <- CAMBIA ESTO
 
 async function extraerPlaylist() {
     console.log(`[Minerador] Extrayendo metadatos de la lista... esto tomará un momento.`);

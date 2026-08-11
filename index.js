@@ -121,7 +121,7 @@ async function streamToZeno(filePath, trackTitle) {
         
         console.log(`[Shell Native] Transmitiendo a ZenoFM -> ${trackTitle}`);
         
-        const cmd = `ffmpeg -itsoffset 1 -re -i "${filePath}" -c:a libmp3lame -b:a 128k -bufsize 64k -content_type audio/mpeg -f mp3 "${icecastUrl}"`;
+        const cmd = `ffmpeg -itsoffset 1 -re -i "${filePath}" -af "loudnorm=I=-16:LRA=11:TP=-1.5" -c:a libmp3lame -b:a 128k -bufsize 64k -content_type audio/mpeg -f mp3 "${icecastUrl}"`;
         
         const ffmpegProcess = spawn(cmd, { shell: true });
 

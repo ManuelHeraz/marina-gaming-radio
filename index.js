@@ -187,7 +187,7 @@ async function startStreaming() {
             console.log(`[yt-dlp] ¡Descarga completa!`);
             audioSource = tempFilePath;
         } catch (error) {
-            console.error(`[Error yt-dlp]: Falló la descarga. Saltando pista.`);
+            console.error(`[Error yt-dlp]: FALLO CRÍTICO. Razón exacta: \n${error.message}`);
             cleanup(tempFilePath);
             return retryWithCooldown(startTime);
         }

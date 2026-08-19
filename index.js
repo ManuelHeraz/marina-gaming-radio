@@ -162,7 +162,33 @@ async function streamToZeno(filePath, trackTitle) {
     });
 }
 
+// --- SISTEMA DE DESCARGA BLINDADO (ESTRATEGIA HIDRA) ---
+async function descargarConEstrategiaHidra(audioSource, tempFilePath) {
+    // Los clientes de la Hidra que ya probaste y sabes que funcionan
+    const CLIENTS = ['android', 'ios', 'web'];
+    
+    for (const clientId of CLIENTS) {
+        console.log(`[yt-dlp] Intentando descarga con cliente: ${clientId}...`);
+        try {
+            await exec(audioSource, {
+                f: 'bestaudio/best[height<=480]/best',
+                o: tempFilePath,
+                'extractor-args': `youtube:player_client=${clientId}`,
+                'socket-timeout': '10',
+                'retries': '3',
+                noWarnings: true
+            });
+            console.log(`[yt-dlp] ¡Descarga exitosa usando ${clientId}!`);
+            return true; // Éxito total, rompemos el bucle
+        } catch (error) {
+            console.log(`[yt-dlp] Cliente ${clientId} rechazado por YouTube. Probando siguiente...`);
+        }
+    }
+    return false; // Si los tres fallan, la Hidra muere temporalmente
+}
+
 // --- BUCLE PRINCIPAL ---
+
 async function startStreaming() {
     const track = await getNextTrack();
     console.log(`\n[AutoDJ] Preparando: ${track.title}`);
@@ -176,21 +202,53 @@ async function startStreaming() {
 
     if (isExternalUrl) {
         tempFilePath = path.join(tempDir, `track-${Date.now()}.m4a`);
-        console.log(`[yt-dlp] Descargando la pista en caché efímera...`);
+        console.log(`[yt-dlp] Iniciando protocolo Hidra para descarga efímera...`);
         
-        try {
-            await exec(audioSource, {
-                f: '140/bestaudio[ext=m4a]/bestaudio',
-                o: tempFilePath,
-                noWarnings: true
-            });
-            console.log(`[yt-dlp] ¡Descarga completa!`);
-            audioSource = tempFilePath;
-        } catch (error) {
-            console.error(`[Error yt-dlp]: FALLO CRÍTICO. Razón exacta: \n${error.message}`);
-            cleanup(tempFilePath);
-            return retryWithCooldown(startTime);
+        let descargaExitosa = await descargarConEstrategiaHidra(audioSource, tempFilePath);
+        
+        // BUCLE DE RESGUARDO (Cortinillas en loop si YouTube se pone pesado)
+        while (!descargaExitosa) {
+            console.error(`[Alerta Radiodifusión] YouTube bloqueó el enlace. Entrando en modo de resguardo con cortinillas...`);
+            
+            // Seleccionamos una cortinilla de emergencia al azar para entretener a la audiencia
+            const assetsDir = path.join(__dirname, 'assets');
+            const bumpersPath = path.join(assetsDir, 'bumpers.json');
+            let bumperAux = { title: "Marina Gaming - Bumper de Emergencia", source: path.join(assetsDir, "c1.mp3") }; // Respaldo duro
+            
+            if (fs.existsSync(bumpersPath)) {
+                try {
+                    const raw = fs.readFileSync(bumpersPath, 'utf8');
+                    const parsed = JSON.parse(raw);
+                    if (parsed && parsed.tracks && parsed.tracks.length > 0) {
+                        bumperAux = parsed.tracks[Math.floor(Math.random() * parsed.tracks.length)];
+                    }
+                } catch(e) {}
+            }
+
+            console.log(`[Modo Resguardo] Transmitiendo cortinilla temporal: ${bumperAux.title}`);
+            
+            // Si la cortinilla es externa, la baja; si es local, la usa directo
+            let sourceBumper = bumperAux.source;
+            let tempBumperPath = null;
+            if (sourceBumper.includes('youtube.com') || sourceBumper.includes('youtu.be')) {
+                tempBumperPath = path.join(tempDir, `bumper-${Date.now()}.m4a`);
+                await descargarConEstrategiaHidra(sourceBumper, tempBumperPath);
+                sourceBumper = tempBumperPath;
+            }
+
+            // Transmitimos la cortinilla de relleno mientras la canción principal sigue intentando bajar
+            try {
+                await streamToZeno(sourceBumper, `[En espera de conexión] ${bumperAux.title}`);
+            } catch(err) {}
+            
+            if (tempBumperPath) cleanup(tempBumperPath);
+
+            // Reintentamos descargar la canción original de nuevo tras tocar la cortinilla
+            console.log(`[yt-dlp] Reintentando descargar la canción pendiente...`);
+            descargaExitosa = await descargarConEstrategiaHidra(audioSource, tempFilePath);
         }
+        
+        audioSource = tempFilePath;
     }
 
     try {

@@ -206,47 +206,44 @@ async function startStreaming() {
         
         let descargaExitosa = await descargarConEstrategiaHidra(audioSource, tempFilePath);
         
-        // BUCLE DE RESGUARDO (Cortinillas en loop si YouTube se pone pesado)
+        // --- BUCLE DE RESGUARDO (ESTRICTAMENTE LOCAL) ---
         while (!descargaExitosa) {
-            console.error(`[Alerta Radiodifusión] YouTube bloqueó el enlace. Entrando en modo de resguardo con cortinillas...`);
+            console.error(`[Alerta] YouTube bloqueó el enlace. Entrando en modo de resguardo LOCAL...`);
             
-            // Seleccionamos una cortinilla de emergencia al azar para entretener a la audiencia
             const assetsDir = path.join(__dirname, 'assets');
-            const bumpersPath = path.join(assetsDir, 'bumpers.json');
-            let bumperAux = { title: "Marina Gaming - Bumper de Emergencia", source: path.join(assetsDir, "c1.mp3") }; // Respaldo duro
-            
-            if (fs.existsSync(bumpersPath)) {
+            let localBumperSource = null;
+            let localBumperTitle = "Desconocido";
+
+            // 1. Buscamos EXCLUSIVAMENTE archivos .mp3 físicos en el disco duro
+            if (fs.existsSync(assetsDir)) {
+                const mp3Files = fs.readdirSync(assetsDir).filter(file => file.endsWith('.mp3'));
+                if (mp3Files.length > 0) {
+                    const randomFile = mp3Files[Math.floor(Math.random() * mp3Files.length)];
+                    localBumperSource = path.join(assetsDir, randomFile);
+                    localBumperTitle = `Marina Gaming - ${randomFile.replace('.mp3', '')}`;
+                }
+            }
+
+            // 2. Si encontramos un MP3 local, lo transmitimos
+            if (localBumperSource) {
+                console.log(`[Modo Resguardo] Transmitiendo cortinilla local (Fuera de línea): ${localBumperTitle}`);
                 try {
-                    const raw = fs.readFileSync(bumpersPath, 'utf8');
-                    const parsed = JSON.parse(raw);
-                    if (parsed && parsed.tracks && parsed.tracks.length > 0) {
-                        bumperAux = parsed.tracks[Math.floor(Math.random() * parsed.tracks.length)];
-                    }
-                } catch(e) {}
+                    await streamToZeno(localBumperSource, `[Reconectando] ${localBumperTitle}`);
+                } catch(err) {
+                    console.error(`[Error Transmitiendo Resguardo]: ${err.message}`);
+                    await sleep(5000); 
+                }
+            } else {
+                // 3. Sistema anti-colapso: Si no hay MP3 locales, forzamos un silencio de 30 segundos
+                console.log(`[Modo Resguardo] No se encontraron MP3 locales. Pausando el servidor 30 segundos para enfriar IP...`);
+                await sleep(30000); 
             }
 
-            console.log(`[Modo Resguardo] Transmitiendo cortinilla temporal: ${bumperAux.title}`);
-            
-            // Si la cortinilla es externa, la baja; si es local, la usa directo
-            let sourceBumper = bumperAux.source;
-            let tempBumperPath = null;
-            if (sourceBumper.includes('youtube.com') || sourceBumper.includes('youtu.be')) {
-                tempBumperPath = path.join(tempDir, `bumper-${Date.now()}.m4a`);
-                await descargarConEstrategiaHidra(sourceBumper, tempBumperPath);
-                sourceBumper = tempBumperPath;
-            }
-
-            // Transmitimos la cortinilla de relleno mientras la canción principal sigue intentando bajar
-            try {
-                await streamToZeno(sourceBumper, `[En espera de conexión] ${bumperAux.title}`);
-            } catch(err) {}
-            
-            if (tempBumperPath) cleanup(tempBumperPath);
-
-            // Reintentamos descargar la canción original de nuevo tras tocar la cortinilla
-            console.log(`[yt-dlp] Reintentando descargar la canción pendiente...`);
+            // 4. Una vez terminado el audio local (o la pausa), reintentamos descargar la canción
+            console.log(`[yt-dlp] Cooldown terminado. Reintentando descargar la canción pendiente...`);
             descargaExitosa = await descargarConEstrategiaHidra(audioSource, tempFilePath);
         }
+        // --- FIN DEL BUCLE DE RESGUARDO ---
         
         audioSource = tempFilePath;
     }

@@ -206,15 +206,18 @@ async function startStreaming() {
         
         let descargaExitosa = await descargarConEstrategiaHidra(audioSource, tempFilePath);
         
-        // --- BUCLE DE RESGUARDO (ESTRICTAMENTE LOCAL) ---
-        while (!descargaExitosa) {
-            console.error(`[Alerta] YouTube bloqueó el enlace. Entrando en modo de resguardo LOCAL...`);
+        // --- BUCLE DE RESGUARDO (ESTRICTAMENTE LOCAL CON LÍMITE) ---
+        let intentosResguardo = 0;
+        const MAX_INTENTOS = 2; // Si falla 2 veces, abortamos la canción y pasamos a la siguiente
+
+        while (!descargaExitosa && intentosResguardo < MAX_INTENTOS) {
+            intentosResguardo++;
+            console.error(`[Alerta] YouTube bloqueó el enlace. Entrando en modo de resguardo LOCAL (Intento ${intentosResguardo}/${MAX_INTENTOS})...`);
             
             const assetsDir = path.join(__dirname, 'assets');
             let localBumperSource = null;
             let localBumperTitle = "Desconocido";
 
-            // 1. Buscamos EXCLUSIVAMENTE archivos .mp3 físicos en el disco duro
             if (fs.existsSync(assetsDir)) {
                 const mp3Files = fs.readdirSync(assetsDir).filter(file => file.endsWith('.mp3'));
                 if (mp3Files.length > 0) {
@@ -224,7 +227,6 @@ async function startStreaming() {
                 }
             }
 
-            // 2. Si encontramos un MP3 local, lo transmitimos
             if (localBumperSource) {
                 console.log(`[Modo Resguardo] Transmitiendo cortinilla local (Fuera de línea): ${localBumperTitle}`);
                 try {
@@ -234,17 +236,22 @@ async function startStreaming() {
                     await sleep(5000); 
                 }
             } else {
-                // 3. Sistema anti-colapso: Si no hay MP3 locales, forzamos un silencio de 30 segundos
-                console.log(`[Modo Resguardo] No se encontraron MP3 locales. Pausando el servidor 30 segundos para enfriar IP...`);
+                console.log(`[Modo Resguardo] No se encontraron MP3 locales. Pausando el servidor 30 segundos...`);
                 await sleep(30000); 
             }
 
-            // 4. Una vez terminado el audio local (o la pausa), reintentamos descargar la canción
             console.log(`[yt-dlp] Cooldown terminado. Reintentando descargar la canción pendiente...`);
             descargaExitosa = await descargarConEstrategiaHidra(audioSource, tempFilePath);
         }
         // --- FIN DEL BUCLE DE RESGUARDO ---
         
+        // Si después del límite sigue fallando, declaramos la pista como muerta y seguimos adelante
+        if (!descargaExitosa) {
+            console.error(`[Fallo Crítico] Imposible descargar esta pista. Saltando a la siguiente canción en la fila...`);
+            cleanup(tempFilePath);
+            return retryWithCooldown(startTime);
+        }
+
         audioSource = tempFilePath;
     }
 

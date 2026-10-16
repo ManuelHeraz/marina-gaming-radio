@@ -4,16 +4,6 @@ const fs = require('fs');
 // PON AQUÍ TODOS LOS ENLACES QUE QUIERAS SEPARADOS POR COMAS Y ENTRE COMILLAS
 const PLAYLIST_URLS = [
     "https://youtube.com/playlist?list=PL6v0YAHfvjfmMO-Nk1W2JnWrrx62ZL439&si=m3Murl8-vXlpqkTP",
-    "https://youtube.com/playlist?list=PL6v0YAHfvjfkKGnjzge5Tm5NGR-guymSG&si=0WSyygM4A_Pt8cWj",
-    "https://youtube.com/playlist?list=PLE90wbxeVJe3-p5NlJ9pestQ5NtL1KFOu&si=luGplWe_Klsa2imJ",
-    "https://youtube.com/playlist?list=PLyPN4yau_b5ABhovJb8dvTpszMhBLSXbj&si=AQPUyE0aUGIHuXn4",
-    "https://youtube.com/playlist?list=PLJ57eLLt_4Beei5eTqf9JVwEzCTvsuRiU&si=FJZ5rAxbi0cKrthk",
-    "https://youtube.com/playlist?list=PLH09LP-3uTZf0pslxwCZ3Wl2km2r0qYpC&si=NniXaAWB9I1OAZt8",
-    "https://youtube.com/playlist?list=PLBCEdCTyxWQ-gVv_6r2YQLcsSipifWVrZ&si=UsUJ79cFiP6CjJcb",
-    "https://youtube.com/playlist?list=PL_9Vs-PDx24xZXmAfNVQXqQ0gCmaXxE3W&si=BIaPlZwgjuv1Soxd",
-    "https://youtube.com/playlist?list=PLE90wbxeVJe1WSigGnSP8ARFJ9pUhQy4w&si=Yl0pj83cE5FIp1rJ",
-    "https://youtube.com/playlist?list=PLCutjjq7vO82JIyKJ97sIJxXCnRMXfndQ&si=hGBkBXlFQuIZbnB5",
-    "https://youtube.com/playlist?list=PLCutjjq7vO83dxVqiq4wUmdi4u-W4i-Kb&si=6sSuM0Dd6cIMpYlz"
 ];
 
 async function procesarPlaylists() {

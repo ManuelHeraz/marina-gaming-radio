@@ -1,0 +1,168 @@
+{
+  "zona_horaria": "America/Mexico_City",
+  "cortinillas_peticion": [
+    {
+      "title": "MG Radio - Solicitud de la Comunidad (Sci-Fi)",
+      "source": "https://www.youtube.com/watch?v=Qe81TJRKhf0"
+    },
+    {
+      "title": "MG Radio - Solicitud de la Comunidad (DJ)",
+      "source": "https://www.youtube.com/watch?v=Qe81TJRKhf0"
+    }
+  ],
+  "comerciales": [
+    {
+      "title": "Spot 1 - Únete a la Comunidad Marina Gaming",
+      "source": "https://www.youtube.com/watch?v=cxXKtU0VH_g"
+    },
+    {
+      "title": "Spot 2 - Promo Checkpoint Gaming Podcast",
+      "source": "https://www.youtube.com/watch?v=ZG_dumjBNYQ"
+    },
+    {
+      "title": "Spot 3 - Parrilla Musical 24/7 y Alexa",
+      "source": "https://www.youtube.com/watch?v=XPLYUt-BLqc"
+    },
+    {
+      "title": "Spot 4 - El Poder de MARbot y Marina Gaming TV",
+      "source": "https://www.youtube.com/watch?v=W8-rvgOcCfw"
+    },
+    {
+      "title": "Spot 5 - Sube de Rango y Medalla Secreta",
+      "source": "https://www.youtube.com/watch?v=DSFn_M8QfCk"
+    },
+    {
+      "title": "Spot 6 - Academia de Creación de Contenido",
+      "source": "https://www.youtube.com/watch?v=r5-pJELjg8k"
+    },
+    {
+      "title": "Spot 7 - Noticias Gamer con MARbot",
+      "source": "https://www.youtube.com/watch?v=cW91bDDUR_Y"
+    },
+    {
+      "title": "Spot 8 - El Rincón de la Historia Mundial",
+      "source": "https://www.youtube.com/watch?v=8hOLsKP96Wg"
+    }
+  ],
+  "shows": {
+    "seleccion_marbot": {
+      "nombre": "Selección de MARbot",
+      "tipo": "musical",
+      "playlist": "playlist.json",
+      "intro": { "title": "Apertura - Selección de MARbot", "source": "https://www.youtube.com/watch?v=Nofdmgc12G4" },
+      "mid": { "title": "Intermedia - Selección de MARbot", "source": "https://www.youtube.com/watch?v=t1_oL9V-S7o" }
+    },
+    "punto_guardado": {
+      "nombre": "Punto de Guardado",
+      "tipo": "musical",
+      "playlist": "playlists/punto_guardado.json",
+      "intro": { "title": "Apertura - Punto de Guardado", "source": "https://www.youtube.com/watch?v=4e14sXPUTvM" },
+      "mid": { "title": "Intermedia - Punto de Guardado", "source": "https://www.youtube.com/watch?v=FCbDGK_qv6s" }
+    },
+    "maquina_tiempo": {
+      "nombre": "La Máquina del Tiempo",
+      "tipo": "musical",
+      "playlist": "playlists/maquina_tiempo.json",
+      "intro": { "title": "Apertura - La Máquina del Tiempo", "source": "https://www.youtube.com/watch?v=71oLwsiPKbI" },
+      "mid": { "title": "Intermedia - La Máquina del Tiempo", "source": "https://www.youtube.com/watch?v=w-gOdITly2c" }
+    },
+    "hora_64bits": {
+      "nombre": "La Hora de 64 Bits",
+      "tipo": "musical",
+      "playlist": "playlists/hora_64bits.json",
+      "intro": { "title": "Apertura - La Hora de 64 Bits", "source": "https://www.youtube.com/watch?v=71oLwsiPKbI" },
+      "mid": { "title": "Intermedia - La Hora de 64 Bits", "source": "https://www.youtube.com/watch?v=w-gOdITly2c" }
+    },
+    "mundos_indie": {
+      "nombre": "Mundos Indie & Taberna",
+      "tipo": "musical",
+      "playlist": "playlists/mundos_indie.json",
+      "intro": { "title": "Apertura - Mundos Indie", "source": "https://www.youtube.com/watch?v=Nofdmgc12G4" },
+      "mid": { "title": "Intermedia - Mundos Indie", "source": "https://www.youtube.com/watch?v=t1_oL9V-S7o" }
+    },
+    "hora_zelda": {
+      "nombre": "La Hora de Zelda",
+      "tipo": "musical",
+      "playlist": "playlists/hora_zelda.json",
+      "intro": { "title": "Apertura - La Hora de Zelda", "source": "https://www.youtube.com/watch?v=fNue9HBv0KU" },
+      "mid": { "title": "Intermedia - La Hora de Zelda", "source": "https://www.youtube.com/watch?v=JGeY7Z796AQ" }
+    },
+    "zona_otaku": {
+      "nombre": "Zona Otaku",
+      "tipo": "musical",
+      "playlist": "playlists/zona_otaku.json",
+      "intro": { "title": "Apertura - Zona Otaku", "source": "https://www.youtube.com/watch?v=EshL4VL0gAQ" },
+      "mid": { "title": "Intermedia - Zona Otaku", "source": "https://www.youtube.com/watch?v=J3liAyvdAsY" }
+    },
+    "frecuencia_hispana": {
+      "nombre": "Frecuencia Hispana",
+      "tipo": "musical",
+      "playlist": "playlists/frecuencia_hispana.json",
+      "intro": { "title": "Apertura - Frecuencia Hispana", "source": "https://www.youtube.com/watch?v=a-nkVQyTE-A" },
+      "mid": { "title": "Intermedia - Frecuencia Hispana", "source": "https://www.youtube.com/watch?v=jPKj8eUbsQU" }
+    },
+    "hora_halo": {
+      "nombre": "La Hora de Halo",
+      "tipo": "musical",
+      "playlist": "playlists/hora_halo.json",
+      "intro": { "title": "Apertura - La Hora de Halo", "source": "https://www.youtube.com/watch?v=bjaHX7MYAiA" },
+      "mid": { "title": "Intermedia - La Hora de Halo", "source": "https://www.youtube.com/watch?v=y3vmKiSO0yU" }
+    },
+    "boss_rush": {
+      "nombre": "Boss Rush Hour",
+      "tipo": "musical",
+      "playlist": "playlists/boss_rush.json",
+      "intro": { "title": "Apertura - Boss Rush Hour", "source": "https://www.youtube.com/watch?v=5s_BaCWMqZM" },
+      "mid": { "title": "Intermedia - Boss Rush Hour", "source": "https://www.youtube.com/watch?v=OiXaTHgVKaY" }
+    },
+    "estacion_los_santos": {
+      "nombre": "Estación Los Santos",
+      "tipo": "musical",
+      "playlist": "playlists/estacion_los_santos.json",
+      "intro": { "title": "Apertura - Estación Los Santos", "source": "https://www.youtube.com/watch?v=V8hy8wq_-F4" },
+      "mid": { "title": "Intermedia - Estación Los Santos", "source": "https://www.youtube.com/watch?v=V8hy8wq_-F4" }
+    },
+    "conexion_vice_city": {
+      "nombre": "Conexión Vice City",
+      "tipo": "musical",
+      "playlist": "playlists/conexion_vice_city.json",
+      "intro": { "title": "Apertura - Conexión Vice City", "source": "https://www.youtube.com/watch?v=V8hy8wq_-F4" },
+      "mid": { "title": "Intermedia - Conexión Vice City", "source": "https://www.youtube.com/watch?v=V8hy8wq_-F4" }
+    },
+    "festival_horizon": {
+      "nombre": "Festival Horizon",
+      "tipo": "musical",
+      "playlist": "playlists/festival_horizon.json",
+      "intro": { "title": "Apertura - Festival Horizon", "source": "https://www.youtube.com/watch?v=jTzKMS5xXLs" },
+      "mid": { "title": "Intermedia - Festival Horizon", "source": "https://www.youtube.com/watch?v=jTzKMS5xXLs" }
+    },
+    "checkpoint_gaming": {
+      "nombre": "Checkpoint Gaming Podcast",
+      "tipo": "podcast",
+      "playlist_podcasts": "playlists/checkpoint_podcasts.json",
+      "playlist_musica": "playlist.json",
+      "intro": { "title": "Apertura - Checkpoint Gaming", "source": "https://www.youtube.com/watch?v=vc6DWLcPHRM" },
+      "mid": { "title": "Intermedia - Checkpoint Gaming", "source": "https://www.youtube.com/watch?v=ohKFxFbn_HM" }
+    }
+  },
+  "horarios": [
+    { "dias": [0,1,2,3,4,5,6], "inicio": "00:00", "fin": "06:00", "show": "seleccion_marbot" },
+    { "dias": [0,1,2,3,4,5,6], "inicio": "06:00", "fin": "09:00", "show": "punto_guardado" },
+    { "dias": [1,2,3,4,5],     "inicio": "09:00", "fin": "11:00", "show": "maquina_tiempo" },
+    { "dias": [0,6],           "inicio": "09:00", "fin": "11:00", "show": "hora_64bits" },
+    { "dias": [1,2,3,4,5],     "inicio": "11:00", "fin": "13:00", "show": "mundos_indie" },
+    { "dias": [0,6],           "inicio": "11:00", "fin": "13:00", "show": "hora_zelda" },
+    { "dias": [0,1,2,3,4,5,6], "inicio": "13:00", "fin": "15:00", "show": "zona_otaku" },
+    { "dias": [0,1,2,3,4,5,6], "inicio": "15:00", "fin": "16:30", "show": "frecuencia_hispana" },
+    { "dias": [1,3],           "inicio": "16:30", "fin": "18:00", "show": "hora_zelda" },
+    { "dias": [2,4,5,6,0],     "inicio": "16:30", "fin": "18:00", "show": "hora_halo" },
+    { "dias": [0,1,2,3,4,5,6], "inicio": "18:00", "fin": "20:00", "show": "boss_rush" },
+    { "dias": [1,2,3,4],       "inicio": "20:00", "fin": "21:00", "show": "estacion_los_santos" },
+    { "dias": [5,6,0],         "inicio": "20:00", "fin": "21:00", "show": "checkpoint_gaming" },
+    { "dias": [1,2,3,4],       "inicio": "21:00", "fin": "22:30", "show": "conexion_vice_city" },
+    { "dias": [5,6,0],         "inicio": "21:00", "fin": "22:30", "show": "festival_horizon" },
+    { "dias": [1,2,3,4],       "inicio": "22:30", "fin": "24:00", "show": "festival_horizon" },
+    { "dias": [5],             "inicio": "22:30", "fin": "24:00", "show": "estacion_los_santos" },
+    { "dias": [6,0],           "inicio": "22:30", "fin": "24:00", "show": "conexion_vice_city" }
+  ]
+}

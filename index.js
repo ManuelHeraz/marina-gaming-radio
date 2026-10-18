@@ -1,19 +1,20 @@
 'use strict';
 /**
- * MARINA GAMING RADIO - AutoDJ (versión estable / sin cortes)
+ * MARINA GAMING RADIO - AutoDJ v2.0 (Parrilla Horaria CDMX + Podcasts en 3 Partes + Prioridad MongoDB)
  *
  * Arquitectura:
- *
  *   [yt-dlp] -> temp/track-N.m4a -> [ffmpeg DECODER] --PCM--> [ffmpeg ENCODER] -> Icecast/ZenoFM
- *                (uno por pista)                              (UNO, vive siempre)
+ *                (uno por pista / segmento)                     (UNO, vive siempre)
  *
- *  - El ENCODER mantiene UNA sola conexión a Icecast. Entre canciones no hay
- *    desconexión, así que los oyentes no sufren cortes ni rebuffering.
- *  - La SIGUIENTE canción se descarga y se pre-decodifica mientras suena la actual
- *    (gapless). Si algo tarda de más, se rellena con silencio en vez de cortar.
- *  - Si Icecast/red se congela, un watchdog reinicia el encoder y la canción
- *    actual continúa donde iba.
- *  - Las peticiones de MongoDB (Discord) conservan prioridad absoluta.
+ * Nuevas Funciones:
+ *  - Reloj en tiempo real ajustado a CDMX (GMT-6) leyendo programacion.json.
+ *  - Peticiones de MongoDB con prioridad absoluta: reproduce cortinilla de petición SOLO
+ *    antes de la primera solicitud de una racha; se rearma cuando la cola de MongoDB se vacía.
+ *  - Ciclo de shows musicales: Intro al cambiar de programa, y cada 4 canciones inserta:
+ *    [Cortinilla Estándar] -> [Comercial] -> [Cortinilla Mid del Show].
+ *  - Modo Podcast (Checkpoint Gaming): Descarga un episodio aleatorio, mide su duración exacta
+ *    y lo divide virtualmente en 3 partes iguales (sin recodificar en disco), intercalando
+ *    Cortinilla Estándar + Canción + Cortinilla del Show entre cada parte.
  */
 
 require('dotenv').config();
@@ -30,12 +31,13 @@ const env = process.env;
 const CONFIG = {
     sampleRate: 44100,
     bitrate: env.BITRATE || '128k',
-    bumperEvery: 4,                                              // cortinilla cada N canciones del respaldo
-    prefetchLeadMs: (Number(env.PREFETCH_LEAD_SECONDS) || 45) * 1000, // cuánto antes de terminar se prepara la siguiente
-    writeWatchdogMs: 20000,                                      // encoder sin aceptar datos => reinicio
-    decoderStallMs: 20000,                                       // decoder sin producir datos => se descarta la pista
-    downloadTimeoutMs: 90000,                                    // máximo por intento de yt-dlp
-    loudnorm: env.LOUDNORM !== '0',                              // LOUDNORM=0 desactiva la normalización (ahorra CPU)
+    bumperEvery: 4,                                               // ciclo cada 4 canciones
+    prefetchLeadMs: (Number(env.PREFETCH_LEAD_SECONDS) || 45) * 1000,
+    writeWatchdogMs: 20000,                                       // encoder sin aceptar datos => reinicio
+    decoderStallMs: 20000,                                        // decoder sin producir datos => descarta pista
+    downloadTimeoutMs: 90000,                                     // 90s para canciones normales
+    podcastDownloadTimeoutMs: 240000,                             // 4 min para episodios de podcast largos
+    loudnorm: env.LOUDNORM !== '0',
     dbName: 'marina_radio',
     dbCollection: 'cola_reproduccion',
 };
@@ -51,6 +53,7 @@ const ASSETS_DIR = path.join(__dirname, 'assets');
 const TEMP_DIR = path.join(__dirname, 'temp');
 const PLAYLIST_FILE = path.join(__dirname, 'playlist.json');
 const BUMPERS_FILE = path.join(ASSETS_DIR, 'bumpers.json');
+const PROGRAMACION_FILE = path.join(__dirname, 'programacion.json');
 
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -65,7 +68,7 @@ function resolveFfmpeg() {
 const FFMPEG = resolveFfmpeg();
 
 let shuttingDown = false;
-const children = new Set(); // procesos hijos vivos, para matarlos al cerrar
+const children = new Set();
 
 function track(proc) {
     children.add(proc);
@@ -73,25 +76,84 @@ function track(proc) {
     return proc;
 }
 
-// ───────────────────────── CARGA DE LISTAS ─────────────────────────
+// Obtiene la duración exacta en segundos de un archivo descargado usando ffmpeg -i
+function probeDurationSec(filePath) {
+    try {
+        const res = spawnSync(FFMPEG, ['-hide_banner', '-i', filePath], { encoding: 'utf8', timeout: 10000 });
+        const output = (res.stderr || '') + (res.stdout || '');
+        const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(output);
+        if (m) {
+            return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+        }
+    } catch (e) {
+        log('Probe', `No se pudo medir duración de ${path.basename(filePath)}: ${e.message}`);
+    }
+    return 0;
+}
+
+// ───────────────────────── CARGA DE LISTAS Y BARAJAS ─────────────────────────
+// Verifica que una pista exista y no tenga el texto placeholder "PONER_LINK"
+function isPlayableTrack(t) {
+    return Boolean(
+        t &&
+        typeof t.title === 'string' &&
+        typeof t.source === 'string' &&
+        t.source.trim() !== '' &&
+        !t.source.includes('PONER_LINK')
+    );
+}
+
 function loadTracks(file) {
     try {
+        if (!fs.existsSync(file)) return [];
         const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
         const data = JSON.parse(raw);
-        const list = Array.isArray(data.tracks) ? data.tracks : [];
-        return list.filter((t) => t && typeof t.title === 'string' && typeof t.source === 'string' && t.source);
+        const list = Array.isArray(data.tracks) ? data.tracks : (Array.isArray(data) ? data : []);
+        return list.filter(isPlayableTrack);
     } catch (e) {
         log('Cerebro', `No se pudo leer ${path.basename(file)}: ${e.message}`);
         return [];
     }
 }
 
-const library = loadTracks(PLAYLIST_FILE);
-if (library.length === 0) {
+const mainLibrary = loadTracks(PLAYLIST_FILE);
+if (mainLibrary.length === 0) {
     console.error('[Fatal] playlist.json está vacío o es inválido. Nada que transmitir.');
     process.exit(1);
 }
-log('Sistema', `Bóveda cargada: ${library.length} pistas.`);
+log('Sistema', `Bóveda general cargada: ${mainLibrary.length} pistas.`);
+
+// Sistema de barajas sin repetición por archivo de playlist
+const decks = new Map();
+
+function nextFromPlaylistFile(relOrAbsPath) {
+    const fullPath = path.isAbsolute(relOrAbsPath) ? relOrAbsPath : path.join(__dirname, relOrAbsPath);
+    let tracks = loadTracks(fullPath);
+
+    // Si la playlist del show aún no existe o está vacía, usa la bóveda general
+    let key = fullPath;
+    if (tracks.length === 0) {
+        tracks = mainLibrary;
+        key = PLAYLIST_FILE;
+    }
+
+    let state = decks.get(key);
+    if (!state || state.deck.length === 0 || state.total !== tracks.length) {
+        const deck = tracks.map((_, i) => i);
+        for (let i = deck.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [deck[i], deck[j]] = [deck[j], deck[i]];
+        }
+        if (state && deck.length > 1 && deck[deck.length - 1] === state.lastIndex) {
+            [deck[0], deck[deck.length - 1]] = [deck[deck.length - 1], deck[0]];
+        }
+        state = { deck, lastIndex: -1, total: tracks.length };
+        decks.set(key, state);
+    }
+
+    state.lastIndex = state.deck.pop();
+    return { ...tracks[state.lastIndex], trusted: true };
+}
 
 function localBumpers() {
     if (!fs.existsSync(ASSETS_DIR)) return [];
@@ -100,7 +162,7 @@ function localBumpers() {
         .map((f) => ({ title: `Marina Gaming - ${f.replace(/\.mp3$/i, '')}`, source: path.join(ASSETS_DIR, f), trusted: true }));
 }
 
-function allBumpers() {
+function allGeneralBumpers() {
     const list = localBumpers();
     if (fs.existsSync(BUMPERS_FILE)) {
         for (const t of loadTracks(BUMPERS_FILE)) list.push({ ...t, trusted: true });
@@ -108,31 +170,101 @@ function allBumpers() {
     return list;
 }
 
-// Baraja sin repeticiones: no se repite ninguna pista hasta recorrer toda la bóveda
-let deck = [];
-let lastIndex = -1;
-function nextFromLibrary() {
-    if (deck.length === 0) {
-        deck = library.map((_, i) => i);
-        for (let i = deck.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [deck[i], deck[j]] = [deck[j], deck[i]];
-        }
-        if (deck.length > 1 && deck[deck.length - 1] === lastIndex) {
-            [deck[0], deck[deck.length - 1]] = [deck[deck.length - 1], deck[0]];
-        }
-    }
-    lastIndex = deck.pop();
-    return { ...library[lastIndex], trusted: true };
+function pickRandomGeneralBumper() {
+    const bumpers = allGeneralBumpers();
+    if (bumpers.length === 0) return null;
+    return bumpers[Math.floor(Math.random() * bumpers.length)];
 }
 
-// ───────────────────────── MONGODB (peticiones de la comunidad) ─────────────────────────
+// ───────────────────────── RELOJ CDMX (GMT-6) Y PROGRAMACIÓN ─────────────────────────
+function loadProgramacion() {
+    try {
+        if (!fs.existsSync(PROGRAMACION_FILE)) return null;
+        const raw = fs.readFileSync(PROGRAMACION_FILE, 'utf8').replace(/^\uFEFF/, '');
+        return JSON.parse(raw);
+    } catch (e) {
+        log('Programación', `Error leyendo programacion.json: ${e.message}`);
+        return null;
+    }
+}
+
+// Obtiene día de la semana (0=Dom..6=Sáb), minutos desde medianoche y fecha YYYY-MM-DD en CDMX (GMT-6)
+function getCdmxTimeInfo() {
+    // CDMX es permanentemente UTC-6
+    const now = new Date();
+    const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const cdmxDate = new Date(utcMs - (6 * 3600000));
+
+    const day = cdmxDate.getDay(); // 0 (Dom) a 6 (Sáb)
+    const hours = cdmxDate.getHours();
+    const minutes = cdmxDate.getMinutes();
+    const totalMinutes = hours * 60 + minutes;
+    const dateKey = `${cdmxDate.getFullYear()}-${String(cdmxDate.getMonth() + 1).padStart(2, '0')}-${String(cdmxDate.getDate()).padStart(2, '0')}`;
+    const timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+
+    return { day, hours, minutes, totalMinutes, dateKey, timeStr };
+}
+
+function parseHhMm(str) {
+    const [h, m] = String(str || '00:00').split(':').map(Number);
+    return (h || 0) * 60 + (m || 0);
+}
+
+function getActiveShow(prog) {
+    if (!prog || !Array.isArray(prog.horarios) || !prog.shows) return null;
+    const { day, totalMinutes, dateKey, timeStr } = getCdmxTimeInfo();
+
+    for (const slot of prog.horarios) {
+        if (!Array.isArray(slot.dias) || !slot.dias.includes(day)) continue;
+        const startMin = parseHhMm(slot.inicio);
+        const endMin = parseHhMm(slot.fin);
+        if (totalMinutes >= startMin && totalMinutes < endMin) {
+            const showDef = prog.shows[slot.show];
+            if (showDef) {
+                return {
+                    id: slot.show,
+                    slotKey: `${dateKey}_${slot.inicio}_${slot.show}`,
+                    timeStr,
+                    ...showDef,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+// Baraja para comerciales sin repetir hasta recorrer todos
+let commercialDeck = [];
+function pickCommercial(prog) {
+    if (!prog || !Array.isArray(prog.comerciales)) return null;
+    const valid = prog.comerciales.filter(isPlayableTrack);
+    if (valid.length === 0) return null;
+
+    if (commercialDeck.length === 0) {
+        commercialDeck = valid.map((_, i) => i);
+        for (let i = commercialDeck.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [commercialDeck[i], commercialDeck[j]] = [commercialDeck[j], commercialDeck[i]];
+        }
+    }
+    const idx = commercialDeck.pop() % valid.length;
+    return { ...valid[idx], trusted: true };
+}
+
+function pickRequestBumper(prog) {
+    if (!prog || !Array.isArray(prog.cortinillas_peticion)) return null;
+    const valid = prog.cortinillas_peticion.filter(isPlayableTrack);
+    if (valid.length === 0) return null;
+    return { ...valid[Math.floor(Math.random() * valid.length)], trusted: true };
+}
+
+// ───────────────────────── MONGODB (Peticiones con Cortinilla Inicial) ─────────────────────────
 let mongo = null;
 function getCollection() {
     if (!env.MONGODB_URI) return null;
     if (!mongo) {
         mongo = new MongoClient(env.MONGODB_URI, {
-            serverSelectionTimeoutMS: 4000, // si la BD cae, NO bloquea la radio 30s
+            serverSelectionTimeoutMS: 4000,
             connectTimeoutMS: 4000,
             socketTimeoutMS: 10000,
             maxPoolSize: 2,
@@ -141,8 +273,6 @@ function getCollection() {
     return mongo.db(CONFIG.dbName).collection(CONFIG.dbCollection);
 }
 
-// Las peticiones vienen de usuarios: solo se aceptan URLs de YouTube/SoundCloud.
-// (Evita que alguien meta una ruta local o una URL interna.)
 function isAllowedUrl(src) {
     try {
         const u = new URL(src);
@@ -160,44 +290,20 @@ async function takeCommunityRequest() {
             const doc = await col.findOneAndDelete({}, { sort: { _id: 1 }, maxTimeMS: 3000 });
             if (!doc) return null;
             if (typeof doc.source === 'string' && isAllowedUrl(doc.source)) {
-                log('Cerebro', 'Petición de la comunidad encontrada. Prioridad máxima.');
+                log('Cerebro', `Petición de la comunidad encontrada: "${doc.title || doc.source}". Prioridad máxima.`);
                 return { title: String(doc.title || 'Petición de la comunidad'), source: doc.source, trusted: false, community: true };
             }
             log('Cerebro', `Petición inválida descartada: ${String(doc.source).slice(0, 80)}`);
         }
     } catch (e) {
-        log('BD', `Error: ${e.message}. Usando respaldo.`);
+        log('BD', `Error: ${e.message}. Usando programación normal.`);
     }
     return null;
 }
 
-// ───────────────────────── EL CEREBRO ─────────────────────────
-let songsSinceBumper = 0;
-
-async function getNextTrack() {
-    // 1. Prioridad absoluta: comunidad
-    const request = await takeCommunityRequest();
-    if (request) return request;
-
-    // 2. ¿Toca cortinilla?
-    if (songsSinceBumper >= CONFIG.bumperEvery) {
-        songsSinceBumper = 0;
-        const bumpers = allBumpers();
-        if (bumpers.length > 0) {
-            log('Cerebro', `Insertando cortinilla aleatoria (${bumpers.length} disponibles).`);
-            return bumpers[Math.floor(Math.random() * bumpers.length)];
-        }
-        log('Cerebro', 'No hay cortinillas disponibles. Saltando...');
-    }
-
-    // 3. Bóveda aleatoria
-    songsSinceBumper++;
-    return nextFromLibrary();
-}
-
 // ───────────────────────── DESCARGA (ESTRATEGIA HIDRA) ─────────────────────────
 const HYDRA_CLIENTS = ['android', 'ios', 'web'];
-let preferredClient = 'android'; // el último cliente que funcionó se prueba primero
+let preferredClient = 'android';
 let downloadSeq = 0;
 
 function cleanupPrefix(filePath) {
@@ -216,7 +322,8 @@ function lastLine(err) {
     return (lines[lines.length - 1] || '').slice(0, 160);
 }
 
-async function downloadAudio(url, outFile) {
+async function downloadAudio(url, outFile, customTimeoutMs) {
+    const timeoutMs = customTimeoutMs || CONFIG.downloadTimeoutMs;
     const isYoutube = /youtube\.com|youtu\.be/i.test(url);
     const clients = isYoutube
         ? [preferredClient, ...HYDRA_CLIENTS.filter((c) => c !== preferredClient)]
@@ -239,7 +346,7 @@ async function downloadAudio(url, outFile) {
             if (client) flags.extractorArgs = `youtube:player_client=${client}`;
             if (env.YTDLP_COOKIES) flags.cookies = env.YTDLP_COOKIES;
 
-            await exec(url, flags, { timeout: CONFIG.downloadTimeoutMs, killSignal: 'SIGKILL' });
+            await exec(url, flags, { timeout: timeoutMs, killSignal: 'SIGKILL' });
 
             if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) {
                 if (client) preferredClient = client;
@@ -254,30 +361,238 @@ async function downloadAudio(url, outFile) {
     return false;
 }
 
-// Devuelve { path, temp } o null si la pista no se pudo preparar
+// ───────────────────────── EL CEREBRO (Horarios, Bloques y Podcasts) ─────────────────────────
+let songsSinceBumper = 0;
+let currentShowId = null;
+let lastPodcastSlotKey = null;
+let enBloquePeticiones = false;
+let peticionEnEspera = null;
+const colaInterna = []; // Cola FIFO para secuencias (Intro, Cortinilla+Comercial+Mid, o los 10 pasos del Podcast)
+
+// Descarga un episodio de podcast, calcula sus 3 tercios y arma la escaleta en colaInterna
+async function buildPodcastSequence(show) {
+    const podPlaylistPath = path.join(__dirname, show.playlist_podcasts || 'playlists/checkpoint_podcasts.json');
+    const podTracks = loadTracks(podPlaylistPath);
+
+    if (podTracks.length === 0) {
+        log('Podcast', 'No hay episodios válidos en checkpoint_podcasts.json. Usando música general.');
+        return false;
+    }
+
+    const chosen = podTracks[Math.floor(Math.random() * podTracks.length)];
+    const podFile = path.join(TEMP_DIR, `podcast-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
+
+    log('Podcast', `Descargando episodio: "${chosen.title}"...`);
+    const ok = await downloadAudio(chosen.source, podFile, CONFIG.podcastDownloadTimeoutMs);
+    if (!ok) {
+        log('Podcast', `Falló la descarga del episodio "${chosen.title}". Pasando a música general.`);
+        return false;
+    }
+
+    const totalSec = probeDurationSec(podFile);
+    if (totalSec < 60) {
+        log('Podcast', `Duración inválida (${totalSec}s). Descartando archivo de podcast.`);
+        cleanupPrefix(podFile);
+        return false;
+    }
+
+    const tercio = Math.floor(totalSec / 3);
+    log('Podcast', `Episodio listo (${Math.round(totalSec / 60)} min). Dividiendo en 3 bloques de ~${Math.round(tercio / 60)} min.`);
+
+    const musicFile = show.playlist_musica || 'playlist.json';
+
+    // 1. Cortinilla de Inicio del Podcast
+    if (isPlayableTrack(show.intro)) {
+        colaInterna.push({ ...show.intro, trusted: true });
+    }
+
+    // 2. Fragmento 1/3 (No borrar archivo al terminar)
+    colaInterna.push({
+        title: `${chosen.title} [Parte 1/3]`,
+        source: podFile,
+        trusted: true,
+        keepTempFile: true,
+        seekSec: 0,
+        durationSec: tercio,
+    });
+
+    // 3. Corte 1: Cortinilla Estándar + Canción + Cortinilla del Show
+    const b1 = pickRandomGeneralBumper();
+    if (b1) colaInterna.push(b1);
+    colaInterna.push(nextFromPlaylistFile(musicFile));
+    if (isPlayableTrack(show.mid)) {
+        colaInterna.push({ ...show.mid, trusted: true });
+    }
+
+    // 4. Fragmento 2/3 (No borrar archivo al terminar)
+    colaInterna.push({
+        title: `${chosen.title} [Parte 2/3]`,
+        source: podFile,
+        trusted: true,
+        keepTempFile: true,
+        seekSec: tercio,
+        durationSec: tercio,
+    });
+
+    // 5. Corte 2: Cortinilla Estándar + Canción + Cortinilla del Show
+    const b2 = pickRandomGeneralBumper();
+    if (b2) colaInterna.push(b2);
+    colaInterna.push(nextFromPlaylistFile(musicFile));
+    if (isPlayableTrack(show.mid)) {
+        colaInterna.push({ ...show.mid, trusted: true });
+    }
+
+    // 6. Fragmento 3/3 (Borrar archivo temporal al terminar)
+    colaInterna.push({
+        title: `${chosen.title} [Parte 3/3]`,
+        source: podFile,
+        trusted: true,
+        keepTempFile: false,
+        forceCleanupTemp: true,
+        seekSec: tercio * 2,
+        durationSec: 0, // hasta el final del archivo
+    });
+
+    return true;
+}
+
+async function getNextTrack() {
+    const prog = loadProgramacion();
+
+    // ── 1. PRIORIDAD ABSOLUTA: Solicitudes de la Comunidad (MongoDB) ──
+    if (peticionEnEspera) {
+        const nextReq = peticionEnEspera;
+        peticionEnEspera = null;
+        return nextReq;
+    }
+
+    const request = await takeCommunityRequest();
+    if (request) {
+        if (!enBloquePeticiones) {
+            // Es la PRIMERA solicitud de este bloque: suena cortinilla previa y guardamos la canción en espera
+            enBloquePeticiones = true;
+            const reqBumper = pickRequestBumper(prog);
+            if (reqBumper) {
+                log('Cerebro', 'Iniciando bloque de peticiones con cortinilla de la comunidad.');
+                peticionEnEspera = request;
+                return reqBumper;
+            }
+        }
+        // Si ya estábamos en bloque de peticiones (o no hay cortinilla configurada), suena directo
+        return request;
+    } else {
+        // La cola de MongoDB está vacía: rearmamos la bandera para la próxima racha
+        if (enBloquePeticiones) {
+            log('Cerebro', 'Cola de peticiones de la comunidad vacía. Retomando programación.');
+            enBloquePeticiones = false;
+        }
+    }
+
+    // ── 2. COLA DE SECUENCIAS EN CURSO (Cortes comerciales o bloques de Podcast) ──
+    if (colaInterna.length > 0) {
+        return colaInterna.shift();
+    }
+
+    // ── 3. VERIFICACIÓN DE HORARIO Y CAMBIO DE SHOW (CDMX GMT-6) ──
+    const activeShow = getActiveShow(prog);
+
+    if (activeShow) {
+        if (activeShow.id !== currentShowId) {
+            log('Horario CDMX', `[${activeShow.timeStr}] Cambiando al bloque: "${activeShow.nombre}"`);
+            currentShowId = activeShow.id;
+            songsSinceBumper = 0;
+
+            // Si el nuevo bloque es de tipo musical y tiene cortinilla de apertura, la encolamos
+            if (activeShow.tipo !== 'podcast' && isPlayableTrack(activeShow.intro)) {
+                colaInterna.push({ ...activeShow.intro, trusted: true });
+            }
+        }
+
+        // Si estamos en el bloque de Podcast y aún no se ha emitido en esta hora
+        if (activeShow.tipo === 'podcast' && lastPodcastSlotKey !== activeShow.slotKey) {
+            lastPodcastSlotKey = activeShow.slotKey;
+            const built = await buildPodcastSequence(activeShow);
+            if (built && colaInterna.length > 0) {
+                return colaInterna.shift();
+            }
+        }
+    }
+
+    // Si se agregó una intro de show recién cambiado a colaInterna, la reproducimos primero
+    if (colaInterna.length > 0) {
+        return colaInterna.shift();
+    }
+
+    // ── 4. CICLO DE CADA 4 CANCIONES: [Cortinilla Estándar] -> [Comercial] -> [Cortinilla del Show] ──
+    if (songsSinceBumper >= CONFIG.bumperEvery) {
+        songsSinceBumper = 0;
+
+        const stdBumper = pickRandomGeneralBumper();
+        const commercial = pickCommercial(prog);
+        const showMid = (activeShow && isPlayableTrack(activeShow.mid))
+            ? { ...activeShow.mid, trusted: true }
+            : null;
+
+        if (stdBumper) colaInterna.push(stdBumper);
+        if (commercial) colaInterna.push(commercial);
+        if (showMid) colaInterna.push(showMid);
+
+        if (colaInterna.length > 0) {
+            log('Cerebro', `Insertando corte de estación (${colaInterna.length} elementos).`);
+            return colaInterna.shift();
+        }
+    }
+
+    // ── 5. CANCIÓN DEL SHOW ACTIVO (O BÓVEDA GENERAL) ──
+    songsSinceBumper++;
+    if (activeShow) {
+        const targetPlaylist = activeShow.tipo === 'podcast'
+            ? (activeShow.playlist_musica || 'playlist.json')
+            : (activeShow.playlist || 'playlist.json');
+        return nextFromPlaylistFile(targetPlaylist);
+    }
+
+    return nextFromPlaylistFile('playlist.json');
+}
+
+// ───────────────────────── RESOLUCIÓN DE FUENTES Y DECODER ─────────────────────────
 async function resolveSource(trk) {
     const src = trk.source;
     const isUrl = /^https?:\/\//i.test(src);
 
     if (!isUrl) {
-        if (!trk.trusted) return null; // una petición nunca puede apuntar a archivos locales
-        return fs.existsSync(src) ? { path: src, temp: false } : null;
+        if (!trk.trusted) return null;
+        if (!fs.existsSync(src)) return null;
+        return {
+            path: src,
+            temp: Boolean(trk.forceCleanupTemp),
+            keepTempFile: Boolean(trk.keepTempFile),
+        };
     }
     if (!trk.trusted && !isAllowedUrl(src)) return null;
 
     const outFile = path.join(TEMP_DIR, `track-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
     const ok = await downloadAudio(src, outFile);
-    return ok ? { path: outFile, temp: true } : null;
+    return ok ? { path: outFile, temp: true, keepTempFile: false } : null;
 }
 
-// ───────────────────────── DECODER (uno por pista) ─────────────────────────
-function prepareDecoder(file, title) {
-    const args = ['-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info', '-i', file, '-vn', '-sn', '-dn'];
+function prepareDecoder(file, title, seekSec = 0, durationSec = 0) {
+    const args = ['-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info'];
+    if (seekSec > 0) args.push('-ss', String(seekSec));
+    args.push('-i', file);
+    if (durationSec > 0) args.push('-t', String(durationSec));
+    args.push('-vn', '-sn', '-dn');
     if (CONFIG.loudnorm) args.push('-af', 'loudnorm=I=-16:LRA=11:TP=-1.5');
     args.push('-f', 's16le', '-acodec', 'pcm_s16le', '-ar', String(CONFIG.sampleRate), '-ac', '2', 'pipe:1');
 
     const proc = track(spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] }));
-    const dec = { proc, title, durationMs: 0, exited: false, tail: '' };
+    const dec = {
+        proc,
+        title,
+        durationMs: durationSec > 0 ? durationSec * 1000 : 0,
+        exited: false,
+        tail: '',
+    };
 
     let header = '';
     proc.stderr.on('data', (chunk) => {
@@ -286,7 +601,10 @@ function prepareDecoder(file, title) {
         if (!dec.durationMs && header.length < 8000) {
             header += s;
             const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(header);
-            if (m) dec.durationMs = (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000;
+            if (m) {
+                const totalMs = (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000;
+                dec.durationMs = seekSec > 0 ? Math.max(0, totalMs - seekSec * 1000) : totalMs;
+            }
         }
     });
     proc.on('close', () => { dec.exited = true; });
@@ -301,7 +619,7 @@ const ICECAST_URL =
 
 const ENCODER_ARGS = [
     '-hide_banner', '-nostats', '-loglevel', 'warning',
-    '-re',                                    // el encoder marca el ritmo real (1x); los decoders van por backpressure
+    '-re',
     '-f', 's16le', '-ar', String(CONFIG.sampleRate), '-ac', '2', '-i', 'pipe:0',
     '-c:a', 'libmp3lame', '-b:a', CONFIG.bitrate,
     '-write_xing', '0',
@@ -318,10 +636,10 @@ function startEncoder() {
     const proc = track(spawn(FFMPEG, ENCODER_ARGS, { stdio: ['pipe', 'ignore', 'pipe'] }));
     const enc = { proc, startedAt: Date.now(), dead: false };
 
-    proc.stdin.on('error', () => {}); // los errores llegan por el callback de write()
+    proc.stdin.on('error', () => {});
     proc.stderr.on('data', (d) => {
         const now = Date.now();
-        if (now - lastEncoderLog > 2000) { // evita inundar el log
+        if (now - lastEncoderLog > 2000) {
             lastEncoderLog = now;
             log('Encoder', d.toString().trim().split('\n')[0].slice(0, 200));
         }
@@ -336,7 +654,6 @@ function startEncoder() {
 async function restartEncoder() {
     if (encoder) {
         try { encoder.proc.kill('SIGKILL'); } catch {}
-        // si vivió estable más de 60s, el backoff se reinicia
         restartDelay = Date.now() - encoder.startedAt > 60000 ? 1000 : Math.min(restartDelay * 2, 15000);
         encoder = null;
         log('Encoder', `Reintentando en ${restartDelay / 1000}s...`);
@@ -359,7 +676,7 @@ function rawWrite(enc, chunk) {
         };
         const onExit = () => finish(new Error('encoder terminó'));
         const timer = setTimeout(() => {
-            log('Watchdog', `El encoder no acepta datos hace ${CONFIG.writeWatchdogMs / 1000}s (red caída/congelada). Reiniciando...`);
+            log('Watchdog', `El encoder no acepta datos hace ${CONFIG.writeWatchdogMs / 1000}s. Reiniciando...`);
             try { enc.proc.kill('SIGKILL'); } catch {}
             finish(new Error('watchdog timeout'));
         }, CONFIG.writeWatchdogMs);
@@ -369,7 +686,6 @@ function rawWrite(enc, chunk) {
     });
 }
 
-// Escribe PCM al encoder; si el encoder muere, lo reinicia y reintenta el MISMO fragmento
 async function encoderWrite(chunk) {
     for (;;) {
         if (shuttingDown) throw new Error('apagando');
@@ -380,14 +696,13 @@ async function encoderWrite(chunk) {
             return;
         } catch (e) {
             if (encoder) { encoder.dead = true; }
-            // el siguiente ciclo del for reinicia el encoder
         }
     }
 }
 
 // ───────────────────────── REPRODUCCIÓN ─────────────────────────
-const SILENCE = Buffer.alloc(Math.floor(CONFIG.sampleRate * 4 * 0.25)); // 250 ms de silencio PCM
-const MIN_BYTES = CONFIG.sampleRate * 4 * 0.5;                           // < 0.5s => pista corrupta
+const SILENCE = Buffer.alloc(Math.floor(CONFIG.sampleRate * 4 * 0.25));
+const MIN_BYTES = CONFIG.sampleRate * 4 * 0.5;
 
 async function playDecoder(dec, onFirstChunk) {
     let bytes = 0;
@@ -405,7 +720,7 @@ async function playDecoder(dec, onFirstChunk) {
     arm();
     try {
         for await (const chunk of dec.proc.stdout) {
-            clearTimeout(stallTimer); // mientras se espera al encoder (backpressure) no cuenta como congelado
+            clearTimeout(stallTimer);
             if (bytes === 0 && onFirstChunk) onFirstChunk();
             bytes += chunk.length;
             await encoderWrite(chunk);
@@ -423,16 +738,21 @@ async function playDecoder(dec, onFirstChunk) {
 function disposeItem(item) {
     if (!item) return;
     try { if (!item.dec.exited) item.dec.proc.kill('SIGKILL'); } catch {}
-    if (item.temp) {
+    if (item.temp && !item.keepTempFile) {
         cleanupPrefix(item.path);
     }
 }
 
 async function makeItem(trk, src) {
-    return { track: trk, path: src.path, temp: src.temp, dec: prepareDecoder(src.path, trk.title) };
+    return {
+        track: trk,
+        path: src.path,
+        temp: src.temp,
+        keepTempFile: src.keepTempFile,
+        dec: prepareDecoder(src.path, trk.title, trk.seekSec || 0, trk.durationSec || 0),
+    };
 }
 
-// Obtiene la siguiente pista ya descargada y con su decoder precalentado
 async function acquireTrack() {
     let failures = 0;
     while (!shuttingDown) {
@@ -452,12 +772,11 @@ async function acquireTrack() {
         log('Cerebro', `No se pudo preparar "${trk.title}" (fallo consecutivo ${failures}).`);
 
         if (failures >= 2) {
-            // Modo resguardo: YouTube probablemente nos bloquea; sonamos con material local
             const locals = localBumpers();
             if (locals.length > 0) {
                 const pick = locals[Math.floor(Math.random() * locals.length)];
                 log('Modo Resguardo', `Transmitiendo cortinilla local: ${pick.title}`);
-                return makeItem(pick, { path: pick.source, temp: false });
+                return makeItem(pick, { path: pick.source, temp: false, keepTempFile: false });
             }
             await sleep(Math.min(30000, 5000 * (failures - 1)));
         }
@@ -465,7 +784,6 @@ async function acquireTrack() {
     throw new Error('apagando');
 }
 
-// Espera una promesa rellenando con silencio para que el stream nunca se corte
 async function waitWithSilence(promise) {
     let settled = false;
     promise.then(() => { settled = true; }, () => { settled = true; });
@@ -495,11 +813,9 @@ async function runRadio() {
             }
         };
 
-        log('AutoDJ', `▶ ${current.track.title}`);
+        log('AutoDJ', `▶ [${currentShowId || 'general'}] ${current.track.title}`);
         try {
             await playDecoder(current.dec, () => {
-                // Prepara la siguiente pista justo antes de que termine esta
-                // (así una petición de Discord que llegue a tiempo entra de inmediato)
                 const dur = current.dec.durationMs;
                 const wait = dur ? Math.max(0, dur - CONFIG.prefetchLeadMs) : 20000;
                 prefetchTimer = setTimeout(startPrefetch, wait);
@@ -512,9 +828,8 @@ async function runRadio() {
             disposeItem(current);
         }
 
-        startPrefetch(); // por si no se alcanzó a disparar (pista corta o fallida)
+        startPrefetch();
 
-        // Freno de emergencia: si una pista falló al instante, evita un bucle frenético
         if (Date.now() - startedAt < 3000) await sleep(2000);
     }
 }
@@ -539,14 +854,14 @@ async function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-// Una radio no debe morir por un error suelto
 process.on('uncaughtException', (e) => log('Error no capturado', e.stack || e.message));
 process.on('unhandledRejection', (e) => log('Promesa rechazada', (e && e.stack) || String(e)));
 
 // ───────────────────────── ARRANQUE ─────────────────────────
-console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO ---');
+console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO v2.0 ---');
 fs.mkdirSync(TEMP_DIR, { recursive: true });
-wipeTemp(); // restos de ejecuciones anteriores que se cayeron
+fs.mkdirSync(path.join(__dirname, 'playlists'), { recursive: true });
+wipeTemp();
 
 (async () => {
     for (;;) {

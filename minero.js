@@ -30,7 +30,8 @@ async function extraerPlaylist(url) {
 
             pistas.push({
                 title: title,
-                source: `https://www.youtube.com/watch?v=${entry.id}`
+                source: `https://www.youtube.com/watch?v=${entry.id}`,
+                duration: Number(entry.duration) || 0 // <-- NUEVO: Duración en segundos directo de YouTube
             });
         }
         return pistas;

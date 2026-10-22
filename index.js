@@ -573,7 +573,17 @@ async function resolveSource(trk) {
 
     const outFile = path.join(TEMP_DIR, `track-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
     const ok = await downloadAudio(src, outFile);
-    return ok ? { path: outFile, temp: true, keepTempFile: false } : null;
+    if (!ok) return null;
+
+        // CANDADO DE DURACIÓN EN VIVO (Solo aplica a canciones normales, NO a podcasts ni cortinillas)
+        const durSec = probeDurationSec(outFile);
+        if (durSec > 0 && (durSec < 40 || durSec > 720)) {
+            log('Filtro Tiempo', `Descartando "${trk.title}" por duración fuera de rango (${Math.round(durSec)}s).`);
+            cleanupPrefix(outFile);
+            return null; // El AutoDJ salta inmediatamente a otra canción sin transmitirla
+        }
+
+    return { path: outFile, temp: true, keepTempFile: false };
 }
 
 function prepareDecoder(file, title, seekSec = 0, durationSec = 0) {

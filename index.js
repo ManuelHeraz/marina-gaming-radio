@@ -338,11 +338,11 @@ async function takeCommunityRequest() {
 
 // ───────────────────────── DESCARGA (ESTRATEGIA HIDRA) ─────────────────────────
 // Separamos clientes SIN cookies (android_vr) y clientes CON cookies que evitan SABR (tv,web_creator,mweb)
+// Usamos clientes estándar y de TV que no exigen PO tokens tan agresivos
 const HYDRA_STRATEGIES = [
     { label: 'android_vr (sin cookies)', client: 'android_vr', useCookies: false },
-    { label: 'tv/creator/mweb (con cookies)', client: 'tv,web_creator,mweb', useCookies: true },
-    { label: 'mweb (sin cookies)', client: 'mweb', useCookies: false },
-    { label: 'default (con cookies)', client: null, useCookies: true },
+    { label: 'default (sin cookies)', client: null, useCookies: false },
+    { label: 'ios (sin cookies)', client: 'ios', useCookies: false }
 ];
 const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
 let preferredStrategyIdx = 0;
@@ -417,7 +417,8 @@ async function downloadAudio(url, outFile, opts = {}) {
         log('yt-dlp', `Descargando [${strat.label}]...`);
         try {
             const flags = {
-                format: 'ba*/b*',
+                // Cascada blindada: busca audio puro -> formato 18 (360p con AAC) -> cualquier mejor formato
+                format: 'bestaudio/best[height<=360]/18/best',
                 output: outFile,
                 noPlaylist: true,
                 noPart: true,

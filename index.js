@@ -337,9 +337,15 @@ async function takeCommunityRequest() {
 }
 
 // ───────────────────────── DESCARGA (ESTRATEGIA HIDRA) ─────────────────────────
-// null = que yt-dlp elija sus clientes por defecto; android_vr como respaldo
-const HYDRA_CLIENTS = [null, 'android_vr'];
+// Separamos clientes SIN cookies (android_vr) y clientes CON cookies que evitan SABR (tv,web_creator,mweb)
+const HYDRA_STRATEGIES = [
+    { label: 'android_vr (sin cookies)', client: 'android_vr', useCookies: false },
+    { label: 'tv/creator/mweb (con cookies)', client: 'tv,web_creator,mweb', useCookies: true },
+    { label: 'mweb (sin cookies)', client: 'mweb', useCookies: false },
+    { label: 'default (con cookies)', client: null, useCookies: true },
+];
 const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
+let preferredStrategyIdx = 0;
 let downloadSeq = 0;
 
 function cleanupPrefix(filePath) {
@@ -352,13 +358,15 @@ function cleanupPrefix(filePath) {
     } catch {}
 }
 
-function lastLine(err) {
+// Captura tanto el WARNING relevante como el ERROR final para no trabajar a ciegas
+function summarizeError(err) {
     const text = String(err && (err.stderr || err.message) || err);
     const lines = text.split('\n').map((s) => s.trim()).filter(Boolean);
-    return (lines[lines.length - 1] || '').slice(0, 160);
+    const warn = lines.find((l) => /WARNING:.*(skipping|sabr|nsig|po token|cookies)/i.test(l));
+    const last = lines[lines.length - 1] || '';
+    return (warn ? `${warn} | ${last}` : last).slice(0, 240);
 }
 
-// Aviso claro (máx. 1 cada 10 min) cuando YouTube exige iniciar sesión
 let lastCookieWarn = 0;
 function warnCookies() {
     if (Date.now() - lastCookieWarn < 600000) return;
@@ -366,7 +374,7 @@ function warnCookies() {
     const c = env.YTDLP_COOKIES;
     if (!c) log('Cookies', '⚠ YouTube pide iniciar sesión y YTDLP_COOKIES no está definida en el entorno.');
     else if (!fs.existsSync(c)) log('Cookies', `⚠ YTDLP_COOKIES apunta a un archivo que no existe: ${c}`);
-    else log('Cookies', '⚠ YouTube sigue pidiendo login pese a usar cookies: están expiradas o rotadas. Hay que re-exportarlas (ventana privada + robots.txt).');
+    else log('Cookies', '⚠ YouTube sigue pidiendo login pese a usar cookies: están expiradas o rotadas. Re-expórtalas desde ventana de incógnito.');
 }
 
 // ── Caché de respaldo: las últimas canciones reproducidas con éxito se conservan en disco ──
@@ -380,7 +388,7 @@ function saveToCache(item) {
     try {
         const slug = String(item.track.title).replace(/[^\p{L}\p{N}\- ]+/gu, '').trim().slice(0, 60) || 'cancion';
         fs.renameSync(item.path, path.join(CACHE_DIR, `${Date.now()}__${slug}.m4a`));
-        const files = cachedSongs().sort(); // prefijo de timestamp => orden cronológico
+        const files = cachedSongs().sort();
         while (files.length > CONFIG.cacheMaxFiles) { try { fs.unlinkSync(files.shift()); } catch {} }
     } catch (e) {
         log('Caché', `No se pudo guardar en caché: ${e.message}`);
@@ -392,39 +400,52 @@ function saveToCache(item) {
 async function downloadAudio(url, outFile, opts = {}) {
     const { timeoutMs = CONFIG.downloadTimeoutMs, maxSec = 0 } = opts;
     const isYoutube = /youtube\.com|youtu\.be/i.test(url);
-    const clients = isYoutube ? HYDRA_CLIENTS : [null];
 
-    for (const client of clients) {
+    // Ordenamos para probar primero la última estrategia que funcionó
+    const order = isYoutube
+        ? [
+            HYDRA_STRATEGIES[preferredStrategyIdx],
+            ...HYDRA_STRATEGIES.filter((_, idx) => idx !== preferredStrategyIdx),
+        ]
+        : [{ label: 'direct', client: null, useCookies: false }];
+
+    for (const strat of order) {
         if (shuttingDown) return { ok: false };
-        log('yt-dlp', `Descargando${client ? ` (cliente ${client})` : ''}...`);
+        // Si la estrategia requiere cookies pero no hay archivo configurado, la saltamos
+        if (strat.useCookies && (!env.YTDLP_COOKIES || !fs.existsSync(env.YTDLP_COOKIES))) continue;
+
+        log('yt-dlp', `Descargando [${strat.label}]...`);
         try {
             const flags = {
-                format: 'ba/b',
+                format: 'ba*/b*',
                 output: outFile,
                 noPlaylist: true,
                 noPart: true,
                 noMtime: true,
                 socketTimeout: 10,
-                retries: 3,
+                retries: 2,
                 jsRuntimes: 'node',
             };
-            // "?" => si el video no informa duración, el filtro lo deja pasar; !is_live descarta directos
             if (maxSec) flags.matchFilters = `duration<=?${maxSec} & !is_live`;
-            if (client) flags.extractorArgs = `youtube:player_client=${client}`;
-            if (env.YTDLP_COOKIES) flags.cookies = env.YTDLP_COOKIES;
+            if (strat.client) flags.extractorArgs = `youtube:player_client=${strat.client}`;
+            if (strat.useCookies && env.YTDLP_COOKIES) flags.cookies = env.YTDLP_COOKIES;
 
             const res = await exec(url, flags, { timeout: timeoutMs, killSignal: 'SIGKILL' });
 
-            if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) return { ok: true };
+            if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) {
+                const winIdx = HYDRA_STRATEGIES.indexOf(strat);
+                if (winIdx >= 0) preferredStrategyIdx = winIdx;
+                return { ok: true };
+            }
             if (/does not pass filter/i.test(`${res.stdout || ''}${res.stderr || ''}`)) {
-                return { ok: false, filtered: true }; // fuera de rango: no insistir con otros clientes
+                return { ok: false, filtered: true };
             }
             throw new Error('archivo descargado vacío');
         } catch (e) {
-            log('yt-dlp', `${client || 'default'} falló: ${lastLine(e)}`);
+            log('yt-dlp', `${strat.label} falló: ${summarizeError(e)}`);
             cleanupPrefix(outFile);
             const errText = String(e.stderr || e.message);
-            if (/not a bot|sign in to confirm/i.test(errText)) warnCookies();
+            if (strat.useCookies && /not a bot|sign in to confirm/i.test(errText)) warnCookies();
             if (PERMANENT_ERRORS.test(errText)) break;
         }
     }

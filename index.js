@@ -41,6 +41,7 @@ const CONFIG = {
     podcastDownloadTimeoutMs: 240000,                             // 4 min para episodios de podcast largos
     podcastPrefetchMinutes: Number(env.PODCAST_PREFETCH_MINUTES) || 12, // cuánto antes se descarga el podcast
     maxSongSec: 720,                                              // canciones de más de 12 min se descartan
+    cacheMaxFiles: Number(env.CACHE_MAX_FILES) || 4,             // canciones guardadas como respaldo si YouTube falla
     loudnorm: env.LOUDNORM !== '0',
     dbName: 'marina_radio',
     dbCollection: 'cola_reproduccion',
@@ -58,6 +59,7 @@ const TEMP_DIR = path.join(__dirname, 'temp');
 const PLAYLIST_FILE = path.join(__dirname, 'playlist.json');
 const BUMPERS_FILE = path.join(ASSETS_DIR, 'bumpers.json');
 const PROGRAMACION_FILE = path.join(__dirname, 'programacion.json');
+const CACHE_DIR = path.join(__dirname, 'cache');
 
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -356,6 +358,36 @@ function lastLine(err) {
     return (lines[lines.length - 1] || '').slice(0, 160);
 }
 
+// Aviso claro (máx. 1 cada 10 min) cuando YouTube exige iniciar sesión
+let lastCookieWarn = 0;
+function warnCookies() {
+    if (Date.now() - lastCookieWarn < 600000) return;
+    lastCookieWarn = Date.now();
+    const c = env.YTDLP_COOKIES;
+    if (!c) log('Cookies', '⚠ YouTube pide iniciar sesión y YTDLP_COOKIES no está definida en el entorno.');
+    else if (!fs.existsSync(c)) log('Cookies', `⚠ YTDLP_COOKIES apunta a un archivo que no existe: ${c}`);
+    else log('Cookies', '⚠ YouTube sigue pidiendo login pese a usar cookies: están expiradas o rotadas. Hay que re-exportarlas (ventana privada + robots.txt).');
+}
+
+// ── Caché de respaldo: las últimas canciones reproducidas con éxito se conservan en disco ──
+function cachedSongs() {
+    try {
+        return fs.readdirSync(CACHE_DIR).filter((f) => f.endsWith('.m4a')).map((f) => path.join(CACHE_DIR, f));
+    } catch { return []; }
+}
+
+function saveToCache(item) {
+    try {
+        const slug = String(item.track.title).replace(/[^\p{L}\p{N}\- ]+/gu, '').trim().slice(0, 60) || 'cancion';
+        fs.renameSync(item.path, path.join(CACHE_DIR, `${Date.now()}__${slug}.m4a`));
+        const files = cachedSongs().sort(); // prefijo de timestamp => orden cronológico
+        while (files.length > CONFIG.cacheMaxFiles) { try { fs.unlinkSync(files.shift()); } catch {} }
+    } catch (e) {
+        log('Caché', `No se pudo guardar en caché: ${e.message}`);
+        cleanupPrefix(item.path);
+    }
+}
+
 // Devuelve { ok } o { ok:false, filtered:true } si el video fue rechazado por el filtro de duración
 async function downloadAudio(url, outFile, opts = {}) {
     const { timeoutMs = CONFIG.downloadTimeoutMs, maxSec = 0 } = opts;
@@ -391,7 +423,9 @@ async function downloadAudio(url, outFile, opts = {}) {
         } catch (e) {
             log('yt-dlp', `${client || 'default'} falló: ${lastLine(e)}`);
             cleanupPrefix(outFile);
-            if (PERMANENT_ERRORS.test(String(e.stderr || e.message))) break;
+            const errText = String(e.stderr || e.message);
+            if (/not a bot|sign in to confirm/i.test(errText)) warnCookies();
+            if (PERMANENT_ERRORS.test(errText)) break;
         }
     }
     return { ok: false };
@@ -842,7 +876,9 @@ function disposeItem(item) {
     if (!item) return;
     try { if (!item.dec.exited) item.dec.proc.kill('SIGKILL'); } catch {}
     if (item.temp && !item.keepTempFile) {
-        cleanupPrefix(item.path);
+        // Las canciones que sonaron completas se guardan como respaldo; el resto se borra
+        if (item.played && item.track.isSong && fs.existsSync(item.path)) saveToCache(item);
+        else cleanupPrefix(item.path);
     }
 }
 
@@ -876,6 +912,18 @@ async function acquireTrack() {
         log('Cerebro', `No se pudo preparar "${trk.title}" (fallo consecutivo ${failures}).`);
 
         if (failures >= 2) {
+            // 1º: canciones reales guardadas en caché (la radio sigue sonando aunque YouTube nos bloquee)
+            const cached = cachedSongs();
+            if (cached.length > 0) {
+                const cachedPath = cached[Math.floor(Math.random() * cached.length)];
+                const cachedTitle = path.basename(cachedPath, '.m4a').split('__')[1] || 'Canción en caché';
+                log('Modo Resguardo', `YouTube no responde. Reproduciendo desde caché local: ${cachedTitle}`);
+                return makeItem(
+                    { title: `[Caché] ${cachedTitle}`, source: cachedPath, trusted: true },
+                    { path: cachedPath, temp: false, keepTempFile: false }
+                );
+            }
+            // 2º: cortinillas locales
             const locals = localBumpers();
             if (locals.length > 0) {
                 const pick = locals[Math.floor(Math.random() * locals.length)];
@@ -924,6 +972,7 @@ async function runRadio() {
                 const wait = dur ? Math.max(0, dur - CONFIG.prefetchLeadMs) : 20000;
                 prefetchTimer = setTimeout(startPrefetch, wait);
             });
+            current.played = true;
             log('AutoDJ', 'Pista terminada.');
         } catch (e) {
             log('AutoDJ', `Error en la pista: ${e.message}`);
@@ -966,6 +1015,12 @@ console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO v2.1 ---');
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 fs.mkdirSync(path.join(__dirname, 'playlists'), { recursive: true });
 wipeTemp();
+fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+if (!env.YTDLP_COOKIES) log('Cookies', 'YTDLP_COOKIES no definida: yt-dlp trabajará sin sesión (YouTube suele bloquear IPs de datacenter).');
+else if (!fs.existsSync(env.YTDLP_COOKIES)) log('Cookies', `⚠ El archivo de cookies no existe: ${env.YTDLP_COOKIES}`);
+else log('Cookies', `Usando ${env.YTDLP_COOKIES}`);
+log('Caché', `${cachedSongs().length} canciones de respaldo en disco (máx. ${CONFIG.cacheMaxFiles}).`);
 
 // Revisión en segundo plano: descarga el podcast con antelación (cada 30 s)
 podcastBackgroundTick();

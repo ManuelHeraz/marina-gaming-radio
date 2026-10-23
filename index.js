@@ -1,20 +1,22 @@
 'use strict';
 /**
- * MARINA GAMING RADIO - AutoDJ v2.0 (Parrilla Horaria CDMX + Podcasts en 3 Partes + Prioridad MongoDB)
+ * MARINA GAMING RADIO - AutoDJ v2.1 (Parrilla Horaria CDMX + Podcasts en 3 Partes + Prioridad MongoDB)
  *
  * Arquitectura:
  *   [yt-dlp] -> temp/track-N.m4a -> [ffmpeg DECODER] --PCM--> [ffmpeg ENCODER] -> Icecast/ZenoFM
  *                (uno por pista / segmento)                     (UNO, vive siempre)
  *
- * Nuevas Funciones:
+ * Funciones:
  *  - Reloj en tiempo real ajustado a CDMX (GMT-6) leyendo programacion.json.
  *  - Peticiones de MongoDB con prioridad absoluta: reproduce cortinilla de petición SOLO
  *    antes de la primera solicitud de una racha; se rearma cuando la cola de MongoDB se vacía.
  *  - Ciclo de shows musicales: Intro al cambiar de programa, y cada 4 canciones inserta:
  *    [Cortinilla Estándar] -> [Comercial] -> [Cortinilla Mid del Show].
- *  - Modo Podcast (Checkpoint Gaming): Descarga un episodio aleatorio, mide su duración exacta
- *    y lo divide virtualmente en 3 partes iguales (sin recodificar en disco), intercalando
+ *  - Modo Podcast (Checkpoint Gaming): el episodio se descarga EN SEGUNDO PLANO unos minutos antes
+ *    de que empiece el programa (la música sigue sonando mientras tanto), se mide su duración exacta
+ *    y se divide virtualmente en 3 partes iguales (sin recodificar en disco), intercalando
  *    Cortinilla Estándar + Canción + Cortinilla del Show entre cada parte.
+ *  - Filtro de duración máxima para canciones (descarta vlogs / recopilaciones de horas / directos).
  */
 
 require('dotenv').config();
@@ -37,6 +39,8 @@ const CONFIG = {
     decoderStallMs: 20000,                                        // decoder sin producir datos => descarta pista
     downloadTimeoutMs: 90000,                                     // 90s para canciones normales
     podcastDownloadTimeoutMs: 240000,                             // 4 min para episodios de podcast largos
+    podcastPrefetchMinutes: Number(env.PODCAST_PREFETCH_MINUTES) || 12, // cuánto antes se descarga el podcast
+    maxSongSec: 720,                                              // canciones de más de 12 min se descartan
     loudnorm: env.LOUDNORM !== '0',
     dbName: 'marina_radio',
     dbCollection: 'cola_reproduccion',
@@ -78,17 +82,18 @@ function track(proc) {
 
 // Obtiene la duración exacta en segundos de un archivo descargado usando ffmpeg -i
 function probeDurationSec(filePath) {
-    try {
-        const res = spawnSync(FFMPEG, ['-hide_banner', '-i', filePath], { encoding: 'utf8', timeout: 10000 });
-        const output = (res.stderr || '') + (res.stdout || '');
-        const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(output);
-        if (m) {
-            return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
-        }
-    } catch (e) {
-        log('Probe', `No se pudo medir duración de ${path.basename(filePath)}: ${e.message}`);
-    }
-    return 0;
+    return new Promise((resolve) => {
+        const p = spawn(FFMPEG, ['-hide_banner', '-i', filePath], { stdio: ['ignore', 'ignore', 'pipe'] });
+        let out = '';
+        p.stderr.on('data', (d) => { out += d; });
+        const t = setTimeout(() => p.kill('SIGKILL'), 10000);
+        p.on('error', () => { clearTimeout(t); resolve(0); });
+        p.on('close', () => {
+            clearTimeout(t);
+            const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(out);
+            resolve(m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0);
+        });
+    });
 }
 
 // ───────────────────────── CARGA DE LISTAS Y BARAJAS ─────────────────────────
@@ -152,7 +157,7 @@ function nextFromPlaylistFile(relOrAbsPath) {
     }
 
     state.lastIndex = state.deck.pop();
-    return { ...tracks[state.lastIndex], trusted: true };
+    return { ...tracks[state.lastIndex], trusted: true, isSong: true };
 }
 
 function localBumpers() {
@@ -189,11 +194,13 @@ function loadProgramacion() {
 }
 
 // Obtiene día de la semana (0=Dom..6=Sáb), minutos desde medianoche y fecha YYYY-MM-DD en CDMX (GMT-6)
-function getCdmxTimeInfo() {
+// offsetDays permite consultar "mañana" (1) para detectar programas que empiezan después de medianoche
+function getCdmxTimeInfo(offsetDays = 0) {
     // CDMX es permanentemente UTC-6
     const now = new Date();
     const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
     const cdmxDate = new Date(utcMs - (6 * 3600000));
+    if (offsetDays) cdmxDate.setDate(cdmxDate.getDate() + offsetDays);
 
     const day = cdmxDate.getDay(); // 0 (Dom) a 6 (Sáb)
     const hours = cdmxDate.getHours();
@@ -225,6 +232,32 @@ function getActiveShow(prog) {
                     id: slot.show,
                     slotKey: `${dateKey}_${slot.inicio}_${slot.show}`,
                     timeStr,
+                    ...showDef,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+// Busca un programa de tipo podcast que EMPIECE dentro de los próximos `leadMin` minutos
+function findUpcomingPodcastSlot(prog, leadMin) {
+    if (!prog || !Array.isArray(prog.horarios) || !prog.shows) return null;
+    const nowInfo = getCdmxTimeInfo(0);
+
+    for (const offset of [0, 1]) { // hoy y mañana (por si arranca poco después de medianoche)
+        const info = offset === 0 ? nowInfo : getCdmxTimeInfo(offset);
+        for (const slot of prog.horarios) {
+            const showDef = prog.shows[slot.show];
+            if (!showDef || showDef.tipo !== 'podcast') continue;
+            if (!Array.isArray(slot.dias) || !slot.dias.includes(info.day)) continue;
+
+            const delta = parseHhMm(slot.inicio) + offset * 1440 - nowInfo.totalMinutes;
+            if (delta >= 0 && delta <= leadMin) {
+                return {
+                    id: slot.show,
+                    slotKey: `${info.dateKey}_${slot.inicio}_${slot.show}`,
+                    timeStr: nowInfo.timeStr,
                     ...showDef,
                 };
             }
@@ -291,7 +324,7 @@ async function takeCommunityRequest() {
             if (!doc) return null;
             if (typeof doc.source === 'string' && isAllowedUrl(doc.source)) {
                 log('Cerebro', `Petición de la comunidad encontrada: "${doc.title || doc.source}". Prioridad máxima.`);
-                return { title: String(doc.title || 'Petición de la comunidad'), source: doc.source, trusted: false, community: true };
+                return { title: String(doc.title || 'Petición de la comunidad'), source: doc.source, trusted: false, community: true, isSong: true };
             }
             log('Cerebro', `Petición inválida descartada: ${String(doc.source).slice(0, 80)}`);
         }
@@ -302,8 +335,8 @@ async function takeCommunityRequest() {
 }
 
 // ───────────────────────── DESCARGA (ESTRATEGIA HIDRA) ─────────────────────────
-const HYDRA_CLIENTS = [null, 'android_vr', 'android', 'ios', 'web'];
-let preferredClient = null;
+// null = que yt-dlp elija sus clientes por defecto; android_vr como respaldo
+const HYDRA_CLIENTS = [null, 'android_vr'];
 const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
 let downloadSeq = 0;
 
@@ -323,12 +356,14 @@ function lastLine(err) {
     return (lines[lines.length - 1] || '').slice(0, 160);
 }
 
-async function downloadAudio(url, outFile) {
+// Devuelve { ok } o { ok:false, filtered:true } si el video fue rechazado por el filtro de duración
+async function downloadAudio(url, outFile, opts = {}) {
+    const { timeoutMs = CONFIG.downloadTimeoutMs, maxSec = 0 } = opts;
     const isYoutube = /youtube\.com|youtu\.be/i.test(url);
     const clients = isYoutube ? HYDRA_CLIENTS : [null];
 
     for (const client of clients) {
-        if (shuttingDown) return false;
+        if (shuttingDown) return { ok: false };
         log('yt-dlp', `Descargando${client ? ` (cliente ${client})` : ''}...`);
         try {
             const flags = {
@@ -341,20 +376,96 @@ async function downloadAudio(url, outFile) {
                 retries: 3,
                 jsRuntimes: 'node',
             };
+            // "?" => si el video no informa duración, el filtro lo deja pasar; !is_live descarta directos
+            if (maxSec) flags.matchFilters = `duration<=?${maxSec} & !is_live`;
             if (client) flags.extractorArgs = `youtube:player_client=${client}`;
             if (env.YTDLP_COOKIES) flags.cookies = env.YTDLP_COOKIES;
 
-            await exec(url, flags, { timeout: CONFIG.downloadTimeoutMs, killSignal: 'SIGKILL' });
+            const res = await exec(url, flags, { timeout: timeoutMs, killSignal: 'SIGKILL' });
 
-            if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) return true;
+            if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) return { ok: true };
+            if (/does not pass filter/i.test(`${res.stdout || ''}${res.stderr || ''}`)) {
+                return { ok: false, filtered: true }; // fuera de rango: no insistir con otros clientes
+            }
             throw new Error('archivo descargado vacío');
         } catch (e) {
             log('yt-dlp', `${client || 'default'} falló: ${lastLine(e)}`);
             cleanupPrefix(outFile);
-            if (PERMANENT_ERRORS.test(String(e.stderr || e.message))) break; // video muerto: no insistir
+            if (PERMANENT_ERRORS.test(String(e.stderr || e.message))) break;
         }
     }
-    return false;
+    return { ok: false };
+}
+
+// ───────────────────────── PODCAST: DESCARGA EN SEGUNDO PLANO ─────────────────────────
+// Un episodio por "slot" (fecha + hora + show). Estados: downloading | ready | failed
+const podcastPrep = new Map();
+
+async function downloadPodcastEpisode(show) {
+    const podPlaylistPath = path.join(__dirname, show.playlist_podcasts || 'playlists/checkpoint_podcasts.json');
+    const podTracks = loadTracks(podPlaylistPath);
+
+    if (podTracks.length === 0) {
+        log('Podcast', 'No hay episodios válidos en la playlist de podcasts. Se usará música general.');
+        return null;
+    }
+
+    const chosen = podTracks[Math.floor(Math.random() * podTracks.length)];
+    const podFile = path.join(TEMP_DIR, `podcast-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
+
+    log('Podcast', `Descargando episodio: "${chosen.title}"...`);
+    const dl = await downloadAudio(chosen.source, podFile, { timeoutMs: CONFIG.podcastDownloadTimeoutMs });
+    if (!dl.ok) {
+        log('Podcast', `Falló la descarga del episodio "${chosen.title}".`);
+        return null;
+    }
+
+    const totalSec = await probeDurationSec(podFile);
+    if (totalSec < 60) {
+        log('Podcast', `Duración inválida (${totalSec}s). Descartando archivo de podcast.`);
+        cleanupPrefix(podFile);
+        return null;
+    }
+
+    log('Podcast', `Episodio listo en disco: "${chosen.title}" (${Math.round(totalSec / 60)} min).`);
+    return { chosen, podFile, totalSec };
+}
+
+function ensurePodcastPrep(show) {
+    let prep = podcastPrep.get(show.slotKey);
+    if (prep) return prep;
+
+    prep = { status: 'downloading', episode: null, consumed: false, createdAt: Date.now(), announcedWait: false };
+    podcastPrep.set(show.slotKey, prep);
+
+    downloadPodcastEpisode(show)
+        .then((ep) => { prep.episode = ep; prep.status = ep ? 'ready' : 'failed'; })
+        .catch((e) => { log('Podcast', `Error inesperado: ${e.message}`); prep.status = 'failed'; });
+
+    return prep;
+}
+
+// Se ejecuta cada 30 s: adelanta la descarga del podcast y limpia episodios que nunca se usaron
+function podcastBackgroundTick() {
+    if (shuttingDown) return;
+    try {
+        const prog = loadProgramacion();
+        const upcoming = findUpcomingPodcastSlot(prog, CONFIG.podcastPrefetchMinutes);
+        if (upcoming && !podcastPrep.has(upcoming.slotKey)) {
+            log('Podcast', `"${upcoming.nombre || upcoming.id}" empieza pronto. Descargando episodio en segundo plano...`);
+            ensurePodcastPrep(upcoming);
+        }
+
+        for (const [key, prep] of podcastPrep) {
+            const stale = Date.now() - prep.createdAt > 3 * 3600 * 1000;
+            if (stale && prep.status !== 'downloading') {
+                if (prep.episode && !prep.consumed) cleanupPrefix(prep.episode.podFile);
+                podcastPrep.delete(key);
+            }
+        }
+    } catch (e) {
+        log('Podcast', `Error en la revisión en segundo plano: ${e.message}`);
+    }
 }
 
 // ───────────────────────── EL CEREBRO (Horarios, Bloques y Podcasts) ─────────────────────────
@@ -363,37 +474,13 @@ let currentShowId = null;
 let lastPodcastSlotKey = null;
 let enBloquePeticiones = false;
 let peticionEnEspera = null;
-const colaInterna = []; // Cola FIFO para secuencias (Intro, Cortinilla+Comercial+Mid, o los 10 pasos del Podcast)
+const colaInterna = []; // Cola FIFO para secuencias (Intro, Cortinilla+Comercial+Mid, o los pasos del Podcast)
 
-// Descarga un episodio de podcast, calcula sus 3 tercios y arma la escaleta en colaInterna
-async function buildPodcastSequence(show) {
-    const podPlaylistPath = path.join(__dirname, show.playlist_podcasts || 'playlists/checkpoint_podcasts.json');
-    const podTracks = loadTracks(podPlaylistPath);
-
-    if (podTracks.length === 0) {
-        log('Podcast', 'No hay episodios válidos en checkpoint_podcasts.json. Usando música general.');
-        return false;
-    }
-
-    const chosen = podTracks[Math.floor(Math.random() * podTracks.length)];
-    const podFile = path.join(TEMP_DIR, `podcast-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
-
-    log('Podcast', `Descargando episodio: "${chosen.title}"...`);
-    const ok = await downloadAudio(chosen.source, podFile, CONFIG.podcastDownloadTimeoutMs);
-    if (!ok) {
-        log('Podcast', `Falló la descarga del episodio "${chosen.title}". Pasando a música general.`);
-        return false;
-    }
-
-    const totalSec = probeDurationSec(podFile);
-    if (totalSec < 60) {
-        log('Podcast', `Duración inválida (${totalSec}s). Descartando archivo de podcast.`);
-        cleanupPrefix(podFile);
-        return false;
-    }
-
+// Con el episodio ya descargado, calcula sus 3 tercios y arma la escaleta en colaInterna
+function buildPodcastSequence(show, episode) {
+    const { chosen, podFile, totalSec } = episode;
     const tercio = Math.floor(totalSec / 3);
-    log('Podcast', `Episodio listo (${Math.round(totalSec / 60)} min). Dividiendo en 3 bloques de ~${Math.round(tercio / 60)} min.`);
+    log('Podcast', `Armando escaleta: 3 bloques de ~${Math.round(tercio / 60)} min.`);
 
     const musicFile = show.playlist_musica || 'playlist.json';
 
@@ -448,8 +535,6 @@ async function buildPodcastSequence(show) {
         seekSec: tercio * 2,
         durationSec: 0, // hasta el final del archivo
     });
-
-    return true;
 }
 
 async function getNextTrack() {
@@ -504,17 +589,26 @@ async function getNextTrack() {
             }
         }
 
-        // Si estamos en el bloque de Podcast y aún no se ha emitido en esta hora
+        // Bloque de Podcast que aún no se ha emitido en esta hora.
+        // NUNCA se bloquea esperando la descarga: si no está lista, sigue la música y se reintenta en la siguiente pista.
         if (activeShow.tipo === 'podcast' && lastPodcastSlotKey !== activeShow.slotKey) {
-            lastPodcastSlotKey = activeShow.slotKey;
-            const built = await buildPodcastSequence(activeShow);
-            if (built && colaInterna.length > 0) {
-                return colaInterna.shift();
+            const prep = ensurePodcastPrep(activeShow); // normalmente ya existe (descargado en segundo plano)
+
+            if (prep.status === 'ready') {
+                lastPodcastSlotKey = activeShow.slotKey;
+                prep.consumed = true;
+                buildPodcastSequence(activeShow, prep.episode);
+            } else if (prep.status === 'failed') {
+                lastPodcastSlotKey = activeShow.slotKey;
+                log('Podcast', 'No se pudo preparar el episodio. Este bloque continúa con música.');
+            } else if (!prep.announcedWait) {
+                prep.announcedWait = true;
+                log('Podcast', 'El episodio aún se está descargando. Música mientras tanto; entrará en cuanto esté listo.');
             }
         }
     }
 
-    // Si se agregó una intro de show recién cambiado a colaInterna, la reproducimos primero
+    // Intro de show recién cambiado o escaleta de podcast recién armada: se reproducen primero
     if (colaInterna.length > 0) {
         return colaInterna.shift();
     }
@@ -552,15 +646,21 @@ async function getNextTrack() {
 }
 
 // ───────────────────────── RESOLUCIÓN DE FUENTES Y DECODER ─────────────────────────
+// Devuelve { path, temp, keepTempFile } | { skipped:true } (descartada por duración) | null (fallo)
 async function resolveSource(trk) {
     const src = trk.source;
     const isUrl = /^https?:\/\//i.test(src);
 
     if (!isUrl) {
-        if (!trk.trusted) return null;
-        if (!fs.existsSync(src)) return null;
+        if (!trk.trusted) return null; // una petición nunca puede apuntar a archivos locales
+        // Las rutas relativas (ej. "assets/spot1.mp3") se resuelven desde la carpeta del proyecto
+        const localPath = path.isAbsolute(src) ? src : path.join(__dirname, src);
+        if (!fs.existsSync(localPath)) {
+            log('Cerebro', `Archivo local no encontrado: ${localPath}`);
+            return null;
+        }
         return {
-            path: src,
+            path: localPath,
             temp: Boolean(trk.forceCleanupTemp),
             keepTempFile: Boolean(trk.keepTempFile),
         };
@@ -568,17 +668,14 @@ async function resolveSource(trk) {
     if (!trk.trusted && !isAllowedUrl(src)) return null;
 
     const outFile = path.join(TEMP_DIR, `track-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
-    const ok = await downloadAudio(src, outFile);
-    if (!ok) return null;
 
-        // CANDADO DE DURACIÓN EN VIVO (Solo aplica a canciones normales, NO a podcasts ni cortinillas)
-        const durSec = probeDurationSec(outFile);
-        if (durSec > 0 && (durSec < 40 || durSec > 720)) {
-            log('Filtro Tiempo', `Descartando "${trk.title}" por duración fuera de rango (${Math.round(durSec)}s).`);
-            cleanupPrefix(outFile);
-            return null; // El AutoDJ salta inmediatamente a otra canción sin transmitirla
-        }
-
+    // Solo las canciones llevan filtro (máximo 12 min); cortinillas, spots y podcasts pasan siempre
+    const dl = await downloadAudio(src, outFile, trk.isSong ? { maxSec: CONFIG.maxSongSec } : {});
+    if (dl.filtered) {
+        log('Filtro Tiempo', `Descartando "${trk.title}": dura más de ${CONFIG.maxSongSec / 60} min.`);
+        return { skipped: true };
+    }
+    if (!dl.ok) return null;
     return { path: outFile, temp: true, keepTempFile: false };
 }
 
@@ -772,6 +869,7 @@ async function acquireTrack() {
         }
 
         const src = await resolveSource(trk);
+        if (src && src.skipped) continue; // descartada por duración: no cuenta como fallo
         if (src) return makeItem(trk, src);
 
         failures++;
@@ -864,10 +962,14 @@ process.on('uncaughtException', (e) => log('Error no capturado', e.stack || e.me
 process.on('unhandledRejection', (e) => log('Promesa rechazada', (e && e.stack) || String(e)));
 
 // ───────────────────────── ARRANQUE ─────────────────────────
-console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO v2.0 ---');
+console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO v2.1 ---');
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 fs.mkdirSync(path.join(__dirname, 'playlists'), { recursive: true });
 wipeTemp();
+
+// Revisión en segundo plano: descarga el podcast con antelación (cada 30 s)
+podcastBackgroundTick();
+setInterval(podcastBackgroundTick, 30000).unref();
 
 (async () => {
     for (;;) {

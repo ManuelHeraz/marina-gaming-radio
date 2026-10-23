@@ -302,8 +302,9 @@ async function takeCommunityRequest() {
 }
 
 // ───────────────────────── DESCARGA (ESTRATEGIA HIDRA) ─────────────────────────
-const HYDRA_CLIENTS = ['android', 'ios', 'web'];
-let preferredClient = 'android';
+const HYDRA_CLIENTS = [null, 'android_vr', 'android', 'ios', 'web'];
+let preferredClient = null;
+const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
 let downloadSeq = 0;
 
 function cleanupPrefix(filePath) {
@@ -322,40 +323,35 @@ function lastLine(err) {
     return (lines[lines.length - 1] || '').slice(0, 160);
 }
 
-async function downloadAudio(url, outFile, customTimeoutMs) {
-    const timeoutMs = customTimeoutMs || CONFIG.downloadTimeoutMs;
+async function downloadAudio(url, outFile) {
     const isYoutube = /youtube\.com|youtu\.be/i.test(url);
-    const clients = isYoutube
-        ? [preferredClient, ...HYDRA_CLIENTS.filter((c) => c !== preferredClient)]
-        : [null];
+    const clients = isYoutube ? HYDRA_CLIENTS : [null];
 
     for (const client of clients) {
         if (shuttingDown) return false;
         log('yt-dlp', `Descargando${client ? ` (cliente ${client})` : ''}...`);
         try {
             const flags = {
-                format: 'bestaudio/best[height<=480]/best',
+                format: 'ba/b',
                 output: outFile,
                 noPlaylist: true,
                 noPart: true,
                 noMtime: true,
-                noWarnings: true,
                 socketTimeout: 10,
                 retries: 3,
+                jsRuntimes: 'node',
             };
             if (client) flags.extractorArgs = `youtube:player_client=${client}`;
             if (env.YTDLP_COOKIES) flags.cookies = env.YTDLP_COOKIES;
 
-            await exec(url, flags, { timeout: timeoutMs, killSignal: 'SIGKILL' });
+            await exec(url, flags, { timeout: CONFIG.downloadTimeoutMs, killSignal: 'SIGKILL' });
 
-            if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) {
-                if (client) preferredClient = client;
-                return true;
-            }
+            if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) return true;
             throw new Error('archivo descargado vacío');
         } catch (e) {
-            log('yt-dlp', `${client || 'descarga'} falló: ${lastLine(e)}`);
+            log('yt-dlp', `${client || 'default'} falló: ${lastLine(e)}`);
             cleanupPrefix(outFile);
+            if (PERMANENT_ERRORS.test(String(e.stderr || e.message))) break; // video muerto: no insistir
         }
     }
     return false;

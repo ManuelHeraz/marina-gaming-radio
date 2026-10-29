@@ -1,6 +1,6 @@
 'use strict';
 /**
- * MARINA GAMING RADIO - AutoDJ v2.1 (Parrilla Horaria CDMX + Podcasts en 3 Partes + Prioridad MongoDB)
+ * MARINA GAMING RADIO - AutoDJ v2.2 (Parrilla Horaria CDMX + Podcasts en 3 Partes + Prioridad MongoDB)
  *
  * Arquitectura:
  *   [yt-dlp] -> temp/track-N.m4a -> [ffmpeg DECODER] --PCM--> [ffmpeg ENCODER] -> Icecast/ZenoFM
@@ -17,18 +17,39 @@
  *    y se divide virtualmente en 3 partes iguales (sin recodificar en disco), intercalando
  *    Cortinilla Estándar + Canción + Cortinilla del Show entre cada parte.
  *  - Filtro de duración máxima para canciones (descarta vlogs / recopilaciones de horas / directos).
+ *
+ * Novedades v2.2 (YouTube bloquea IPs de datacenter y cambia sus clientes cada pocas semanas):
+ *  - Estrategias de descarga actualizadas (visionos -> clientes por defecto -> cookies como último recurso).
+ *    Orden editable sin tocar el código con YTDLP_CLIENTS en .env.
+ *  - Disyuntor: si YouTube bloquea, se deja de lanzar yt-dlp un rato (poca CPU) y suena el caché local.
+ *  - Cortinillas/spots/intros se descargan UNA sola vez a disco (assetcache/): ~3 de cada 7 descargas menos.
+ *  - Normalización de volumen estática (mide una vez + ganancia fija): ~6x menos CPU que loudnorm continuo.
+ *  - Auto-actualización de yt-dlp (con respaldo y reversión) y caché de playlist.json por fecha de archivo.
  */
 
 require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
-const { exec } = require('youtube-dl-exec');
+const ytdl = require('youtube-dl-exec');
+const { exec } = ytdl;
+const YTDLP_BIN = (ytdl.constants && ytdl.constants.YOUTUBE_DL_PATH) || path.join(__dirname, 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp');
 const { MongoClient } = require('mongodb');
 
 // ───────────────────────── CONFIGURACIÓN ─────────────────────────
 const env = process.env;
+
+// LOUDNORM: 'static' (por defecto: mide la pista una vez y aplica ganancia fija + limitador, ~6x menos CPU),
+//           'full' (loudnorm continuo, como en v2.1; el más pesado) o 0/off (sin normalizar).
+function normModeFromEnv(v) {
+    const m = String(v === undefined ? '' : v).trim().toLowerCase();
+    if (['0', 'off', 'false', 'no'].includes(m)) return 'off';
+    if (['full', 'loudnorm'].includes(m)) return 'full';
+    return 'static';
+}
 
 const CONFIG = {
     sampleRate: 44100,
@@ -41,8 +62,18 @@ const CONFIG = {
     podcastDownloadTimeoutMs: 240000,                             // 4 min para episodios de podcast largos
     podcastPrefetchMinutes: Number(env.PODCAST_PREFETCH_MINUTES) || 12, // cuánto antes se descarga el podcast
     maxSongSec: 720,                                              // canciones de más de 12 min se descartan
-    cacheMaxFiles: Number(env.CACHE_MAX_FILES) || 4,             // canciones guardadas como respaldo si YouTube falla
-    loudnorm: env.LOUDNORM !== '0',
+    cacheMaxFiles: Number(env.CACHE_MAX_FILES) || 40,            // canciones guardadas como respaldo si YouTube falla (~4 MB c/u)
+    normMode: normModeFromEnv(env.LOUDNORM),
+    failuresBeforeFallback: Number(env.FAILS_BEFORE_FALLBACK) || 1, // pistas fallidas antes de sonar el caché (evita silencios)
+    // ── YouTube / yt-dlp ──
+    ytClients: String(env.YTDLP_CLIENTS || 'visionos,default').split(',').map((s) => s.trim()).filter(Boolean),
+    ytCookieFallback: env.YTDLP_COOKIE_FALLBACK !== '0',          // último intento con cookies (si YTDLP_COOKIES existe)
+    ytRemoteEjs: env.YTDLP_REMOTE_EJS !== '0',                    // yt-dlp baja los scripts EJS oficiales (solo clientes web/tv)
+    ytAutoUpdate: env.YTDLP_AUTOUPDATE !== '0',
+    ytUpdateChannel: env.YTDLP_UPDATE_CHANNEL || 'stable',        // 'stable' o 'nightly'
+    ytFailsToBlock: Number(env.YT_FAILS_TO_BLOCK) || 2,           // pistas seguidas fallidas para abrir el disyuntor
+    ytBlockMinMs: (Number(env.YT_BLOCK_MIN_MINUTES) || 5) * 60000,
+    ytBlockMaxMs: (Number(env.YT_BLOCK_MAX_MINUTES) || 30) * 60000,
     dbName: 'marina_radio',
     dbCollection: 'cola_reproduccion',
 };
@@ -60,6 +91,8 @@ const PLAYLIST_FILE = path.join(__dirname, 'playlist.json');
 const BUMPERS_FILE = path.join(ASSETS_DIR, 'bumpers.json');
 const PROGRAMACION_FILE = path.join(__dirname, 'programacion.json');
 const CACHE_DIR = path.join(__dirname, 'cache');
+const ASSET_DIR = path.join(__dirname, 'assetcache');          // cortinillas/spots/intros descargados una sola vez
+const UPDATE_STAMP = path.join(__dirname, '.ytdlp-last-update');
 
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -80,6 +113,11 @@ function track(proc) {
     children.add(proc);
     proc.once('close', () => children.delete(proc));
     return proc;
+}
+
+// Baja la prioridad de un proceso hijo (yt-dlp, decoder): el encoder -que es el de tiempo real- manda siempre.
+function lowerPriority(proc, niceValue) {
+    try { if (proc && proc.pid) os.setPriority(proc.pid, niceValue); } catch {}
 }
 
 // Obtiene la duración exacta en segundos de un archivo descargado usando ffmpeg -i
@@ -110,13 +148,22 @@ function isPlayableTrack(t) {
     );
 }
 
+// Caché en memoria por tamaño+fecha del archivo: evita re-parsear playlist.json (2 MB, ~16 mil pistas) en cada canción
+const trackFileCache = new Map();
+
 function loadTracks(file) {
     try {
         if (!fs.existsSync(file)) return [];
+        const st = fs.statSync(file);
+        const sig = `${st.size}:${st.mtimeMs}`;
+        const hit = trackFileCache.get(file);
+        if (hit && hit.sig === sig) return hit.list;
         const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
         const data = JSON.parse(raw);
         const list = Array.isArray(data.tracks) ? data.tracks : (Array.isArray(data) ? data : []);
-        return list.filter(isPlayableTrack);
+        const playable = list.filter(isPlayableTrack);
+        trackFileCache.set(file, { sig, list: playable });
+        return playable;
     } catch (e) {
         log('Cerebro', `No se pudo leer ${path.basename(file)}: ${e.message}`);
         return [];
@@ -184,11 +231,17 @@ function pickRandomGeneralBumper() {
 }
 
 // ───────────────────────── RELOJ CDMX (GMT-6) Y PROGRAMACIÓN ─────────────────────────
+let progCache = { sig: '', data: null };
 function loadProgramacion() {
     try {
         if (!fs.existsSync(PROGRAMACION_FILE)) return null;
+        const st = fs.statSync(PROGRAMACION_FILE);
+        const sig = `${st.size}:${st.mtimeMs}`;
+        if (progCache.sig === sig) return progCache.data;
         const raw = fs.readFileSync(PROGRAMACION_FILE, 'utf8').replace(/^\uFEFF/, '');
-        return JSON.parse(raw);
+        const data = JSON.parse(raw);
+        progCache = { sig, data };
+        return data;
     } catch (e) {
         log('Programación', `Error leyendo programacion.json: ${e.message}`);
         return null;
@@ -337,15 +390,106 @@ async function takeCommunityRequest() {
 }
 
 // ───────────────────────── DESCARGA (ESTRATEGIA HIDRA) ─────────────────────────
-// Separamos clientes SIN cookies (android_vr) y clientes CON cookies que evitan SABR (tv,web_creator,mweb)
-// Usamos clientes estándar y de TV que no exigen PO tokens tan agresivos
-const HYDRA_STRATEGIES = [
-    { label: 'android_vr (sin cookies)', client: 'android_vr', useCookies: false },
-    { label: 'cookies + formato directo', client: null, useCookies: true },
-    { label: 'ios (con cookies)', client: 'ios', useCookies: true }
-];
+// Situación 2026: YouTube exige PO Token (GVS) a casi todos los clientes y bloquea IPs de datacenter.
+//  - android_vr ya no sirve (403 / exige PO Token) y yt-dlp lo retiró de sus clientes por defecto.
+//  - "ios" no admite cookies: yt-dlp lo descarta si le pasas cookies, así que "ios + cookies" nunca funcionaba.
+//  - Con cookies yt-dlp también descarta los clientes que no las admiten (p. ej. visionos), así que las cookies
+//    son el ÚLTIMO recurso, no el segundo.
+//  - visionos no necesita PO Token ni intérprete de JavaScript: es lo más barato en CPU/RAM.
+// El orden se cambia desde .env (YTDLP_CLIENTS=visionos,default,android ...) sin tocar el código.
+function buildStrategies() {
+    const list = CONFIG.ytClients.map((c) => ({
+        label: c === 'default' ? 'clientes por defecto (sin cookies)' : `${c} (sin cookies)`,
+        client: c,
+        useCookies: false,
+    }));
+    if (CONFIG.ytCookieFallback) list.push({ label: 'clientes por defecto + cookies', client: 'default', useCookies: true });
+    return list;
+}
+const HYDRA_STRATEGIES = buildStrategies();
 const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
 let preferredStrategyIdx = 0;
+
+// ── Disyuntor de YouTube: si varias pistas seguidas fallan, se deja de lanzar yt-dlp durante un rato ──
+// (cada intento de yt-dlp cuesta varios segundos de CPU en una e2-micro; insistir solo empeora el bloqueo)
+let ytFailStreak = 0;
+let ytBlockedUntil = 0;
+let ytBackoffMs = CONFIG.ytBlockMinMs;
+let ytBlockLogged = false;
+const ytBlocked = () => Date.now() < ytBlockedUntil;
+
+function ytSuccess() {
+    if (ytFailStreak > 0 || ytBlockedUntil > 0) log('yt-dlp', 'YouTube respondió de nuevo. Descargas normales reanudadas.');
+    ytFailStreak = 0;
+    ytBlockedUntil = 0;
+    ytBackoffMs = CONFIG.ytBlockMinMs;
+    ytBlockLogged = false;
+}
+
+function ytFailure() {
+    ytFailStreak++;
+    if (ytFailStreak < CONFIG.ytFailsToBlock) return;
+    ytBlockedUntil = Date.now() + ytBackoffMs;
+    ytBlockLogged = false;
+    log('yt-dlp', `YouTube bloquea las descargas (${ytFailStreak} pistas seguidas). Pausa de ${(ytBackoffMs / 60000).toFixed(1)} min: suena el caché local y no se lanza yt-dlp.`);
+    ytBackoffMs = Math.min(ytBackoffMs * 2, CONFIG.ytBlockMaxMs);
+    updateYtDlp('bloqueo');   // un bloqueo suele ser un yt-dlp desactualizado: intenta actualizarlo (máx. 1 vez cada 6 h)
+}
+
+// ── Auto-actualización de yt-dlp (con copia de seguridad y reversión si la nueva versión no arranca) ──
+function runYtDlp(args, timeoutMs) {
+    return new Promise((resolve) => {
+        let out = '';
+        const p = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        lowerPriority(p, 10);
+        p.stdout.on('data', (d) => { out += d; });
+        p.stderr.on('data', (d) => { out += d; });
+        const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} }, timeoutMs);
+        p.on('error', (e) => { clearTimeout(t); resolve({ code: -1, out: e.message }); });
+        p.on('close', (code) => { clearTimeout(t); resolve({ code, out: out.trim() }); });
+    });
+}
+
+async function ytVersion() {
+    const r = await runYtDlp(['--version'], 20000);
+    return r.code === 0 ? r.out.split('\n').pop().trim() : null;
+}
+
+let ytUpdating = false;
+async function updateYtDlp(reason) {
+    if (!CONFIG.ytAutoUpdate || shuttingDown || ytUpdating) return;
+    try {
+        const age = Date.now() - fs.statSync(UPDATE_STAMP).mtimeMs;
+        if (age < 6 * 3600 * 1000) return;               // máximo una comprobación cada 6 h (también tras reinicios de pm2)
+    } catch {}
+    ytUpdating = true;
+    try {
+        fs.writeFileSync(UPDATE_STAMP, new Date().toISOString());
+        const before = await ytVersion();
+        if (!before) {
+            log('yt-dlp', `⚠ No se pudo ejecutar yt-dlp (${YTDLP_BIN}). Revisa que exista y que Python sea 3.11 o superior (python3 --version).`);
+            return;
+        }
+        const backup = `${YTDLP_BIN}.bak`;
+        try { fs.copyFileSync(YTDLP_BIN, backup); } catch {}
+        const r = await runYtDlp(['-U', '--update-to', CONFIG.ytUpdateChannel], 180000);
+        const after = await ytVersion();
+        if (!after) {
+            try { fs.copyFileSync(backup, YTDLP_BIN); fs.chmodSync(YTDLP_BIN, 0o755); } catch {}
+            log('yt-dlp', `⚠ La versión nueva no arrancó; se restauró la anterior (${before}). Detalle: ${r.out.split('\n').pop().slice(0, 160)}`);
+        } else if (after !== before) {
+            log('yt-dlp', `Actualizado (${reason}): ${before} -> ${after}`);
+            preferredStrategyIdx = 0;
+            ytFailStreak = 0; ytBlockedUntil = 0; ytBackoffMs = CONFIG.ytBlockMinMs;
+        } else {
+            log('yt-dlp', `Versión ${after} (${reason}): ya está al día en el canal ${CONFIG.ytUpdateChannel}.`);
+        }
+    } catch (e) {
+        log('yt-dlp', `No se pudo actualizar: ${e.message}`);
+    } finally {
+        ytUpdating = false;
+    }
+}
 let downloadSeq = 0;
 
 function cleanupPrefix(filePath) {
@@ -396,19 +540,48 @@ function saveToCache(item) {
     }
 }
 
-// Devuelve { ok } o { ok:false, filtered:true } si el video fue rechazado por el filtro de duración
+// Elige una canción del caché con baraja (no repite hasta recorrerlas todas)
+let cacheDeck = [];
+let lastCachePlayed = null;
+function pickCachedSong() {
+    const files = cachedSongs();
+    if (files.length === 0) return null;
+    cacheDeck = cacheDeck.filter((f) => files.includes(f));
+    if (cacheDeck.length === 0) {
+        cacheDeck = files.slice();
+        for (let i = cacheDeck.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [cacheDeck[i], cacheDeck[j]] = [cacheDeck[j], cacheDeck[i]];
+        }
+        if (cacheDeck.length > 1 && cacheDeck[cacheDeck.length - 1] === lastCachePlayed) {
+            [cacheDeck[0], cacheDeck[cacheDeck.length - 1]] = [cacheDeck[cacheDeck.length - 1], cacheDeck[0]];
+        }
+    }
+    lastCachePlayed = cacheDeck.pop();
+    return lastCachePlayed;
+}
+
+// Devuelve { ok:true } | { ok:false, filtered:true } (rechazado por duración) | { ok:false, ... } (fallo)
 async function downloadAudio(url, outFile, opts = {}) {
-    const { timeoutMs = CONFIG.downloadTimeoutMs, maxSec = 0 } = opts;
+    const { timeoutMs = CONFIG.downloadTimeoutMs, maxSec = 0, ignoreBreaker = false } = opts;
     const isYoutube = /youtube\.com|youtu\.be/i.test(url);
 
+    // Con el disyuntor abierto no se lanza yt-dlp (los podcasts programados lo ignoran: son 1 por hora)
+    if (isYoutube && !ignoreBreaker && ytBlocked()) {
+        if (!ytBlockLogged) {
+            ytBlockLogged = true;
+            log('yt-dlp', `Disyuntor abierto: sin descargas de YouTube hasta dentro de ${Math.ceil((ytBlockedUntil - Date.now()) / 60000)} min.`);
+        }
+        return { ok: false, youtube: true, blocked: true };
+    }
+
     // Ordenamos para probar primero la última estrategia que funcionó
+    const first = HYDRA_STRATEGIES[preferredStrategyIdx] || HYDRA_STRATEGIES[0];
     const order = isYoutube
-        ? [
-            HYDRA_STRATEGIES[preferredStrategyIdx],
-            ...HYDRA_STRATEGIES.filter((_, idx) => idx !== preferredStrategyIdx),
-        ]
+        ? [first, ...HYDRA_STRATEGIES.filter((st) => st !== first)].filter(Boolean)
         : [{ label: 'direct', client: null, useCookies: false }];
 
+    let permanent = false;
     for (const strat of order) {
         if (shuttingDown) return { ok: false };
         // Si la estrategia requiere cookies pero no hay archivo configurado, la saltamos
@@ -417,28 +590,35 @@ async function downloadAudio(url, outFile, opts = {}) {
         log('yt-dlp', `Descargando [${strat.label}]...`);
         try {
             const flags = {
-                // Cascada blindada: busca audio puro -> formato 18 (360p con AAC) -> cualquier mejor formato
-                format: 'bestaudio/best[height<=360]/18/best',
+                // audio puro -> 360p con AAC (formato 18) -> muxed de hasta 480p (nunca un video enorme)
+                format: 'bestaudio/best[height<=360]/18/best[height<=480]',
                 output: outFile,
                 noPlaylist: true,
                 noPart: true,
                 noMtime: true,
                 socketTimeout: 10,
                 retries: 2,
+                forceIpv4: true,                 // las IPv6 de datacenter son aún más sospechosas para YouTube
                 jsRuntimes: 'node',
             };
             if (maxSec) flags.matchFilters = `duration<=?${maxSec} & !is_live`;
-            if (strat.client) flags.extractorArgs = `youtube:player_client=${strat.client}`;
+            if (strat.client && strat.client !== 'default') flags.extractorArgs = `youtube:player_client=${strat.client}`;
             if (strat.useCookies && env.YTDLP_COOKIES) flags.cookies = env.YTDLP_COOKIES;
+            // visionos no usa JS; los clientes web/tv sí necesitan los scripts EJS de yt-dlp
+            if (CONFIG.ytRemoteEjs && strat.client !== 'visionos') flags.remoteComponents = 'ejs:github';
 
-            const res = await exec(url, flags, { timeout: timeoutMs, killSignal: 'SIGKILL' });
+            const sub = exec(url, flags, { timeout: timeoutMs, killSignal: 'SIGKILL' });
+            lowerPriority(sub, 10);
+            const res = await sub;
 
             if (fs.existsSync(outFile) && fs.statSync(outFile).size > 10000) {
                 const winIdx = HYDRA_STRATEGIES.indexOf(strat);
                 if (winIdx >= 0) preferredStrategyIdx = winIdx;
+                if (isYoutube) ytSuccess();
                 return { ok: true };
             }
             if (/does not pass filter/i.test(`${res.stdout || ''}${res.stderr || ''}`)) {
+                if (isYoutube) ytSuccess();       // YouTube respondió; el video simplemente no cumple el filtro
                 return { ok: false, filtered: true };
             }
             throw new Error('archivo descargado vacío');
@@ -447,10 +627,12 @@ async function downloadAudio(url, outFile, opts = {}) {
             cleanupPrefix(outFile);
             const errText = String(e.stderr || e.message);
             if (strat.useCookies && /not a bot|sign in to confirm/i.test(errText)) warnCookies();
-            if (PERMANENT_ERRORS.test(errText)) break;
+            if (PERMANENT_ERRORS.test(errText)) { permanent = true; break; }
         }
     }
-    return { ok: false };
+    // Un video privado/borrado no significa que YouTube nos bloquee: no cuenta para el disyuntor
+    if (isYoutube && !permanent) ytFailure();
+    return { ok: false, youtube: isYoutube, permanent };
 }
 
 // ───────────────────────── PODCAST: DESCARGA EN SEGUNDO PLANO ─────────────────────────
@@ -470,7 +652,7 @@ async function downloadPodcastEpisode(show) {
     const podFile = path.join(TEMP_DIR, `podcast-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
 
     log('Podcast', `Descargando episodio: "${chosen.title}"...`);
-    const dl = await downloadAudio(chosen.source, podFile, { timeoutMs: CONFIG.podcastDownloadTimeoutMs });
+    const dl = await downloadAudio(chosen.source, podFile, { timeoutMs: CONFIG.podcastDownloadTimeoutMs, ignoreBreaker: true });
     if (!dl.ok) {
         log('Podcast', `Falló la descarga del episodio "${chosen.title}".`);
         return null;
@@ -597,13 +779,15 @@ async function getNextTrack() {
     const prog = loadProgramacion();
 
     // ── 1. PRIORIDAD ABSOLUTA: Solicitudes de la Comunidad (MongoDB) ──
-    if (peticionEnEspera) {
+    // Con YouTube bloqueado las peticiones se quedan en MongoDB (si se consumieran, se perderían sin sonar)
+    const ytDown = ytBlocked();
+    if (peticionEnEspera && !ytDown) {
         const nextReq = peticionEnEspera;
         peticionEnEspera = null;
         return nextReq;
     }
 
-    const request = await takeCommunityRequest();
+    const request = ytDown ? null : await takeCommunityRequest();
     if (request) {
         if (!enBloquePeticiones) {
             // Es la PRIMERA solicitud de este bloque: suena cortinilla previa y guardamos la canción en espera
@@ -617,7 +801,7 @@ async function getNextTrack() {
         }
         // Si ya estábamos en bloque de peticiones (o no hay cortinilla configurada), suena directo
         return request;
-    } else {
+    } else if (!ytDown) {
         // La cola de MongoDB está vacía: rearmamos la bandera para la próxima racha
         if (enBloquePeticiones) {
             log('Cerebro', 'Cola de peticiones de la comunidad vacía. Retomando programación.');
@@ -723,6 +907,18 @@ async function resolveSource(trk) {
     }
     if (!trk.trusted && !isAllowedUrl(src)) return null;
 
+    // Cortinillas, spots e intros (fijos y repetitivos): se descargan UNA vez y se reutilizan siempre desde disco.
+    // Así suenan aunque YouTube esté bloqueando y no gastan CPU en cada ciclo de 4 canciones.
+    const isAsset = Boolean(trk.trusted) && !trk.isSong;
+    const assetPath = isAsset
+        ? path.join(ASSET_DIR, `${crypto.createHash('sha1').update(src).digest('hex').slice(0, 16)}.m4a`)
+        : null;
+    if (assetPath) {
+        try {
+            if (fs.statSync(assetPath).size > 10000) return { path: assetPath, temp: false, keepTempFile: false, asset: true };
+        } catch {}
+    }
+
     const outFile = path.join(TEMP_DIR, `track-${process.pid}-${Date.now()}-${++downloadSeq}.m4a`);
 
     // Solo las canciones llevan filtro (máximo 12 min); cortinillas, spots y podcasts pasan siempre
@@ -732,19 +928,35 @@ async function resolveSource(trk) {
         return { skipped: true };
     }
     if (!dl.ok) return null;
+
+    if (assetPath) {
+        try {
+            fs.renameSync(outFile, assetPath);
+            log('Caché', `Guardado en disco para reutilizar: ${trk.title}`);
+            return { path: assetPath, temp: false, keepTempFile: false, asset: true };
+        } catch (e) {
+            log('Caché', `No se pudo guardar ${trk.title}: ${e.message}. Se usará como temporal.`);
+        }
+    }
     return { path: outFile, temp: true, keepTempFile: false };
 }
 
-function prepareDecoder(file, title, seekSec = 0, durationSec = 0) {
+function prepareDecoder(file, title, seekSec = 0, durationSec = 0, gainDb = 0) {
     const args = ['-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info'];
     if (seekSec > 0) args.push('-ss', String(seekSec));
     args.push('-i', file);
     if (durationSec > 0) args.push('-t', String(durationSec));
     args.push('-vn', '-sn', '-dn');
-    if (CONFIG.loudnorm) args.push('-af', 'loudnorm=I=-16:LRA=11:TP=-1.5');
+    if (CONFIG.normMode === 'full') {
+        args.push('-af', 'loudnorm=I=-16:LRA=11:TP=-1.5');
+    } else if (CONFIG.normMode === 'static' && Math.abs(gainDb) >= 0.3) {
+        // ganancia fija calculada por measureGainDb() + limitador a -1.5 dBFS (evita recortes al subir el volumen)
+        args.push('-af', `volume=${gainDb.toFixed(2)}dB,alimiter=limit=0.84:level=0`);
+    }
     args.push('-f', 's16le', '-acodec', 'pcm_s16le', '-ar', String(CONFIG.sampleRate), '-ac', '2', 'pipe:1');
 
     const proc = track(spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] }));
+    lowerPriority(proc, 5);
     const dec = {
         proc,
         title,
@@ -904,14 +1116,69 @@ function disposeItem(item) {
     }
 }
 
+// Mide la sonoridad integrada (EBU R128) UNA vez por archivo y devuelve la ganancia en dB para llegar a -16 LUFS.
+// Cuesta ~1/6 de CPU que loudnorm continuo y nivela igual entre canciones. Se calcula en la fase de descarga
+// (mientras suena la pista anterior) y se recuerda por archivo: cortinillas/spots/podcast no se vuelven a medir.
+const gainCache = new Map();
+function measureGainDb(file) {
+    let key = file;
+    try { const st = fs.statSync(file); key = `${file}|${st.size}|${st.mtimeMs}`; } catch {}
+    if (gainCache.has(key)) return Promise.resolve(gainCache.get(key));
+    return new Promise((resolve) => {
+        const p = spawn(FFMPEG, ['-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info', '-t', '600',
+            '-i', file, '-vn', '-sn', '-dn', '-af', 'ebur128=framelog=quiet', '-f', 'null', '-'],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+        track(p);
+        lowerPriority(p, 5);
+        let err = '';
+        p.stderr.on('data', (d) => { err = (err + d).slice(-4000); });
+        const done = (gain) => {
+            clearTimeout(t);
+            if (gainCache.size > 300) gainCache.delete(gainCache.keys().next().value);
+            gainCache.set(key, gain);
+            resolve(gain);
+        };
+        const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} }, 60000);
+        p.on('error', () => done(0));
+        p.on('close', () => {
+            const m = [...err.matchAll(/I:\s+(-?\d+(?:\.\d+)?)\s+LUFS/g)].pop();
+            const lufs = m ? Number(m[1]) : NaN;
+            // silencio total (-70) o medición fallida: sin ajuste. Límites: -18 dB / +12 dB
+            done(Number.isFinite(lufs) && lufs > -50 ? Math.max(-18, Math.min(12, -16 - lufs)) : 0);
+        });
+    });
+}
+
 async function makeItem(trk, src) {
+    const gainDb = CONFIG.normMode === 'static' ? await measureGainDb(src.path) : 0;
     return {
         track: trk,
         path: src.path,
         temp: src.temp,
         keepTempFile: src.keepTempFile,
-        dec: prepareDecoder(src.path, trk.title, trk.seekSec || 0, trk.durationSec || 0),
+        asset: Boolean(src.asset),
+        dec: prepareDecoder(src.path, trk.title, trk.seekSec || 0, trk.durationSec || 0, gainDb),
     };
+}
+
+// Respaldo cuando YouTube no entrega: 1º canciones reales del caché, 2º cortinillas locales (assets/*.mp3)
+async function fallbackItem() {
+    const cachedPath = pickCachedSong();
+    if (cachedPath) {
+        const cachedTitle = path.basename(cachedPath, '.m4a').split('__')[1] || 'Canción en caché';
+        log('Modo Resguardo', `YouTube no responde. Reproduciendo desde caché local: ${cachedTitle}`);
+        return makeItem(
+            { title: `[Caché] ${cachedTitle}`, source: cachedPath, trusted: true },
+            { path: cachedPath, temp: false, keepTempFile: false }
+        );
+    }
+    const locals = localBumpers();
+    if (locals.length > 0) {
+        const pick = locals[Math.floor(Math.random() * locals.length)];
+        log('Modo Resguardo', `Transmitiendo cortinilla local: ${pick.title}`);
+        return makeItem(pick, { path: pick.source, temp: false, keepTempFile: false });
+    }
+    return null;
 }
 
 async function acquireTrack() {
@@ -933,26 +1200,11 @@ async function acquireTrack() {
         failures++;
         log('Cerebro', `No se pudo preparar "${trk.title}" (fallo consecutivo ${failures}).`);
 
-        if (failures >= 4) {
-            // 1º: canciones reales guardadas en caché (la radio sigue sonando aunque YouTube nos bloquee)
-            const cached = cachedSongs();
-            if (cached.length > 0) {
-                const cachedPath = cached[Math.floor(Math.random() * cached.length)];
-                const cachedTitle = path.basename(cachedPath, '.m4a').split('__')[1] || 'Canción en caché';
-                log('Modo Resguardo', `YouTube no responde. Reproduciendo desde caché local: ${cachedTitle}`);
-                return makeItem(
-                    { title: `[Caché] ${cachedTitle}`, source: cachedPath, trusted: true },
-                    { path: cachedPath, temp: false, keepTempFile: false }
-                );
-            }
-            // 2º: cortinillas locales
-            const locals = localBumpers();
-            if (locals.length > 0) {
-                const pick = locals[Math.floor(Math.random() * locals.length)];
-                log('Modo Resguardo', `Transmitiendo cortinilla local: ${pick.title}`);
-                return makeItem(pick, { path: pick.source, temp: false, keepTempFile: false });
-            }
-            await sleep(Math.min(30000, 5000 * (failures - 1)));
+        // Con YouTube bloqueado (o tras un fallo) se pasa DIRECTO al respaldo: nada de silencios ni reintentos en cadena
+        if (ytBlocked() || failures >= CONFIG.failuresBeforeFallback) {
+            const fb = await fallbackItem();
+            if (fb) return fb;
+            await sleep(Math.min(30000, 5000 * failures));
         }
     }
     throw new Error('apagando');
@@ -998,6 +1250,9 @@ async function runRadio() {
             log('AutoDJ', 'Pista terminada.');
         } catch (e) {
             log('AutoDJ', `Error en la pista: ${e.message}`);
+            if (current.asset) {
+                try { fs.unlinkSync(current.path); log('Caché', 'Archivo fijo dañado descartado; se descargará de nuevo.'); } catch {}
+            }
         } finally {
             clearTimeout(prefetchTimer);
             disposeItem(current);
@@ -1033,16 +1288,22 @@ process.on('uncaughtException', (e) => log('Error no capturado', e.stack || e.me
 process.on('unhandledRejection', (e) => log('Promesa rechazada', (e && e.stack) || String(e)));
 
 // ───────────────────────── ARRANQUE ─────────────────────────
-console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO v2.1 ---');
+console.log('--- INICIALIZANDO AUTO-DJ MARINA GAMING RADIO v2.2 ---');
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 fs.mkdirSync(path.join(__dirname, 'playlists'), { recursive: true });
 wipeTemp();
 fs.mkdirSync(CACHE_DIR, { recursive: true });
+fs.mkdirSync(ASSET_DIR, { recursive: true });
 
 if (!env.YTDLP_COOKIES) log('Cookies', 'YTDLP_COOKIES no definida: yt-dlp trabajará sin sesión (YouTube suele bloquear IPs de datacenter).');
 else if (!fs.existsSync(env.YTDLP_COOKIES)) log('Cookies', `⚠ El archivo de cookies no existe: ${env.YTDLP_COOKIES}`);
 else log('Cookies', `Usando ${env.YTDLP_COOKIES}`);
 log('Caché', `${cachedSongs().length} canciones de respaldo en disco (máx. ${CONFIG.cacheMaxFiles}).`);
+log('yt-dlp', `Estrategias: ${HYDRA_STRATEGIES.map((st) => st.label).join(' > ')} | normalización: ${CONFIG.normMode}`);
+
+// yt-dlp: versión en el log + comprobación de actualización 30 s después del arranque y luego cada 24 h
+setTimeout(() => updateYtDlp('arranque'), 30000).unref();
+setInterval(() => updateYtDlp('diaria'), 24 * 3600 * 1000).unref();
 
 // Revisión en segundo plano: descarga el podcast con antelación (cada 30 s)
 podcastBackgroundTick();

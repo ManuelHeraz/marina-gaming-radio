@@ -340,8 +340,8 @@ async function takeCommunityRequest() {
 // Separamos clientes SIN cookies (android_vr) y clientes CON cookies que evitan SABR (tv,web_creator,mweb)
 // Usamos clientes estándar y de TV que no exigen PO tokens tan agresivos
 const HYDRA_STRATEGIES = [
-    { label: 'cookies + formato directo', client: null, useCookies: true },
     { label: 'android_vr (sin cookies)', client: 'android_vr', useCookies: false },
+    { label: 'cookies + formato directo', client: null, useCookies: true },
     { label: 'ios (con cookies)', client: 'ios', useCookies: true }
 ];
 const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
@@ -933,7 +933,7 @@ async function acquireTrack() {
         failures++;
         log('Cerebro', `No se pudo preparar "${trk.title}" (fallo consecutivo ${failures}).`);
 
-        if (failures >= 2) {
+        if (failures >= 4) {
             // 1º: canciones reales guardadas en caché (la radio sigue sonando aunque YouTube nos bloquee)
             const cached = cachedSongs();
             if (cached.length > 0) {

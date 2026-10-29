@@ -340,9 +340,9 @@ async function takeCommunityRequest() {
 // Separamos clientes SIN cookies (android_vr) y clientes CON cookies que evitan SABR (tv,web_creator,mweb)
 // Usamos clientes estándar y de TV que no exigen PO tokens tan agresivos
 const HYDRA_STRATEGIES = [
+    { label: 'cookies + formato directo', client: null, useCookies: true },
     { label: 'android_vr (sin cookies)', client: 'android_vr', useCookies: false },
-    { label: 'default (sin cookies)', client: null, useCookies: false },
-    { label: 'ios (sin cookies)', client: 'ios', useCookies: false }
+    { label: 'ios (con cookies)', client: 'ios', useCookies: true }
 ];
 const PERMANENT_ERRORS = /private video|no longer available|terminated|video unavailable|removed|copyright/i;
 let preferredStrategyIdx = 0;
